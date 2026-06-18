@@ -44,8 +44,8 @@
 
 use bytes::{Bytes, BytesMut};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, OsRng},
 };
 use compio::io::{AsyncRead, AsyncWrite};
 use rand::RngCore;
@@ -161,7 +161,8 @@ impl CurveKeyPair {
     }
 
     /// Create from existing keys
-    pub const fn from_keys(public: CurvePublicKey, secret: CurveSecretKey) -> Self {
+    pub fn from_keys(_public: CurvePublicKey, secret: CurveSecretKey) -> Self {
+        let public = secret.public_key();
         Self { public, secret }
     }
 }
@@ -927,6 +928,19 @@ mod tests {
         // Verify public key matches secret key
         let derived_public = keypair.secret.public_key();
         assert_eq!(keypair.public, derived_public);
+    }
+
+    #[test]
+    fn curve_keypair_rejects_public_key_that_does_not_match_secret_key() {
+        let public = CurveKeyPair::generate().public;
+        let secret = CurveSecretKey::generate();
+        let keypair = CurveKeyPair::from_keys(public, secret);
+
+        assert_eq!(
+            keypair.public,
+            keypair.secret.public_key(),
+            "CURVE keypair accepted a public key that does not match its secret key"
+        );
     }
 
     #[test]
