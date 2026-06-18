@@ -20,7 +20,7 @@
 
 use crate::codec::ZmtpError;
 use crate::session::SocketType;
-use crate::utils::{build_ready, encode_frame, FLAG_COMMAND};
+use crate::utils::{FLAG_COMMAND, build_ready, encode_frame};
 use bytes::{Bytes, BytesMut};
 use compio::buf::BufResult;
 use compio::io::{AsyncRead, AsyncWrite};
@@ -103,7 +103,10 @@ where
             ZmtpError::Protocol
         })?;
     write_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 1: Failed to write ZMTP greeting bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 1: Failed to write ZMTP greeting bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -121,7 +124,10 @@ where
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 2: Failed to read ZMTP greeting bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 2: Failed to read ZMTP greeting bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!("[HANDSHAKE] Step 2 DONE: Received peer greeting (64 bytes)");
@@ -155,11 +161,17 @@ where
     let BufResult(write_res, _) = write_all_with_timeout(stream, ready_frame.clone(), timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 4: Failed to send ZMTP READY command: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 4: Failed to send ZMTP READY command: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
     write_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 4: Failed to write ZMTP READY command bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 4: Failed to write ZMTP READY command bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -173,11 +185,17 @@ where
     let BufResult(read_res, header_buf) = read_exact_with_timeout(stream, header_buf, timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY frame header: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to receive ZMTP READY frame header: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY frame header bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 5: Failed to read ZMTP READY frame header bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -204,11 +222,17 @@ where
         let BufResult(read_res, len_buf) = read_exact_with_timeout(stream, len_buf, timeout)
             .await
             .map_err(|e| {
-                warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY long-frame length: {}", e);
+                warn!(
+                    "[HANDSHAKE] Step 5: Failed to receive ZMTP READY long-frame length: {}",
+                    e
+                );
                 ZmtpError::Protocol
             })?;
         read_res.map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY long-frame length bytes: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to read ZMTP READY long-frame length bytes: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
         u64::from_be_bytes(len_buf) as usize
@@ -230,11 +254,17 @@ where
     let BufResult(read_res, body_buf) = read_exact_with_timeout(stream, body_buf, timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY body ({} bytes): {}", body_len, e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to receive ZMTP READY body ({} bytes): {}",
+                body_len, e
+            );
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY body bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 5: Failed to read ZMTP READY body bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!("[HANDSHAKE] Step 5c DONE: Read {} bytes of body", body_len);
@@ -271,7 +301,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use crate::security::plain::{
-        plain_client_handshake, plain_server_handshake, PlainCredentials, StaticPlainHandler,
+        PlainCredentials, StaticPlainHandler, plain_client_handshake, plain_server_handshake,
     };
 
     if options.plain_server {
@@ -427,14 +457,14 @@ fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), Zmtp
         offset += 1;
 
         if offset + key_len > body.len() {
-            break;
+            return Err(ZmtpError::Protocol);
         }
 
         let key = &body[offset..offset + key_len];
         offset += key_len;
 
         if offset + 4 > body.len() {
-            break;
+            return Err(ZmtpError::Protocol);
         }
 
         let value_len = u32::from_be_bytes([
@@ -446,7 +476,7 @@ fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), Zmtp
         offset += 4;
 
         if offset + value_len > body.len() {
-            break;
+            return Err(ZmtpError::Protocol);
         }
 
         // Store the range for zero-copy slice
@@ -473,6 +503,26 @@ fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), Zmtp
         ZmtpError::Protocol
     })?;
     Ok((socket_type, identity))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    #[test]
+    fn ready_parser_rejects_truncated_property_after_socket_type() {
+        let mut body = BytesMut::from(crate::utils::build_ready("PAIR", None).as_ref());
+        body.extend_from_slice(&[8]);
+        body.extend_from_slice(b"Identity");
+        body.extend_from_slice(&5u32.to_be_bytes());
+        body.extend_from_slice(b"a");
+
+        assert!(
+            parse_ready_command(&body.freeze()).is_err(),
+            "READY parser accepted a command with truncated trailing identity metadata"
+        );
+    }
 }
 
 /// Parse socket type from bytes
