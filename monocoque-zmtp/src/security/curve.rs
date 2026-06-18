@@ -612,33 +612,26 @@ impl CurveServer {
             return Err(ZmtpError::Protocol);
         }
 
-        // Read version (1 byte)
-        let version = vec![0u8; 1];
-        let buf_result = read_exact_with_timeout(stream, version, timeout)
+        let body = vec![0u8; 194];
+        let buf_result = read_exact_with_timeout(stream, body, timeout)
             .await
             .map_err(ZmtpError::from)?;
-        let BufResult(result, _version) = buf_result;
+        let BufResult(result, body) = buf_result;
         result?;
 
-        // Read client short-term public key (32 bytes)
-        let client_short_key = vec![0u8; CURVE_KEY_SIZE];
-        let buf_result = read_exact_with_timeout(stream, client_short_key, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, client_short_key) = buf_result;
-        result?;
+        if body[0..2] != [1, 0] {
+            return Err(ZmtpError::Protocol);
+        }
 
         let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&client_short_key);
+        key_array.copy_from_slice(&body[74..106]);
+        if key_array == [0u8; CURVE_KEY_SIZE] {
+            return Err(ZmtpError::Protocol);
+        }
+        if body[114..194].iter().all(|&byte| byte == 0) {
+            return Err(ZmtpError::Protocol);
+        }
         self.client_short_public = Some(CurvePublicKey::from_bytes(key_array));
-
-        // Skip nonce and signature (72 bytes)
-        let skip_buf = vec![0u8; 72];
-        let buf_result = read_exact_with_timeout(stream, skip_buf, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, _) = buf_result;
-        result?;
 
         debug!("[CURVE SERVER] Received HELLO");
         Ok(())
@@ -1036,6 +1029,76 @@ mod tests {
         assert_ne!(
             ciphertext_one, ciphertext_two,
             "CURVE encryption ignored the message counter bytes and reused the AEAD nonce"
+        );
+    }
+
+    fn rfc_curve_hello(version: [u8; 2], client_short_public: &[u8; CURVE_KEY_SIZE]) -> Vec<u8> {
+        let mut hello = Vec::new();
+        hello.extend_from_slice(CURVE_HELLO);
+        hello.extend_from_slice(&version);
+        hello.extend_from_slice(&[0u8; 72]);
+        hello.extend_from_slice(client_short_public);
+        hello.extend_from_slice(&[0u8; 8]);
+        hello.extend_from_slice(&[0u8; 80]);
+        hello
+    }
+
+    async fn server_recv_hello_result(command: Vec<u8>) -> Result<(), ZmtpError> {
+        use compio::buf::BufResult;
+        use compio::net::{TcpListener, TcpStream};
+        use compio::runtime;
+        use monocoque_core::timeout::write_all_with_timeout;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut server = CurveServer::new(CurveKeyPair::generate());
+            server
+                .recv_hello(&mut stream, Some(Duration::from_secs(1)))
+                .await
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let BufResult(write_result, _) =
+            write_all_with_timeout(&mut stream, command, Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+        write_result.unwrap();
+
+        server_task.await
+    }
+
+    #[compio::test]
+    async fn curve_server_rejects_hello_with_unsupported_version() {
+        let client_short = CurveKeyPair::generate();
+        let hello = rfc_curve_hello([2, 0], client_short.public.as_bytes());
+        let result = server_recv_hello_result(hello).await;
+        assert!(
+            result.is_err(),
+            "CURVE server accepted a HELLO command with an unsupported version byte"
+        );
+    }
+
+    #[compio::test]
+    async fn curve_server_rejects_hello_with_all_zero_client_short_key() {
+        let hello = rfc_curve_hello([1, 0], &[0u8; CURVE_KEY_SIZE]);
+        let result = server_recv_hello_result(hello).await;
+        assert!(
+            result.is_err(),
+            "CURVE server accepted an all-zero client short-term public key in HELLO"
+        );
+    }
+
+    #[compio::test]
+    async fn curve_server_rejects_hello_without_client_proof() {
+        let client_short = CurveKeyPair::generate();
+        let hello = rfc_curve_hello([1, 0], client_short.public.as_bytes());
+        let result = server_recv_hello_result(hello).await;
+        assert!(
+            result.is_err(),
+            "CURVE server accepted a HELLO command with an all-zero unauthenticated client proof"
         );
     }
 
