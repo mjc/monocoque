@@ -693,26 +693,24 @@ impl CurveServer {
             warn!("[CURVE SERVER] Invalid INITIATE header");
             return Err(ZmtpError::Protocol);
         }
+        if self.client_short_public.is_none() {
+            return Err(ZmtpError::Protocol);
+        }
 
-        // Read client long-term public key (32 bytes)
-        let client_key = vec![0u8; CURVE_KEY_SIZE];
-        let buf_result = read_exact_with_timeout(stream, client_key, timeout)
+        let body = vec![0u8; 248];
+        let buf_result = read_exact_with_timeout(stream, body, timeout)
             .await
             .map_err(ZmtpError::from)?;
-        let BufResult(result, client_key) = buf_result;
+        let BufResult(result, body) = buf_result;
         result?;
+        if body[0..96].iter().all(|&byte| byte == 0) || body[104..248].iter().all(|&byte| byte == 0)
+        {
+            return Err(ZmtpError::Protocol);
+        }
 
         let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&client_key);
+        key_array.copy_from_slice(&body[104..136]);
         self.client_public = Some(CurvePublicKey::from_bytes(key_array));
-
-        // Skip nonce and vouch (136 bytes)
-        let skip_buf = vec![0u8; 136];
-        let buf_result = read_exact_with_timeout(stream, skip_buf, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, _) = buf_result;
-        result?;
 
         debug!("[CURVE SERVER] Received INITIATE");
         Ok(())
@@ -1070,6 +1068,48 @@ mod tests {
         server_task.await
     }
 
+    fn rfc_curve_initiate() -> Vec<u8> {
+        let mut initiate = Vec::new();
+        initiate.extend_from_slice(CURVE_INITIATE);
+        initiate.extend_from_slice(&[0u8; 96]);
+        initiate.extend_from_slice(&[0u8; 8]);
+        initiate.extend_from_slice(&[0u8; 144]);
+        initiate
+    }
+
+    async fn server_recv_initiate_result(
+        command: Vec<u8>,
+        hello_completed: bool,
+    ) -> Result<(), ZmtpError> {
+        use compio::buf::BufResult;
+        use compio::net::{TcpListener, TcpStream};
+        use compio::runtime;
+        use monocoque_core::timeout::write_all_with_timeout;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut server = CurveServer::new(CurveKeyPair::generate());
+            if hello_completed {
+                server.client_short_public = Some(CurveKeyPair::generate().public);
+            }
+            server
+                .recv_initiate(&mut stream, Some(Duration::from_secs(1)))
+                .await
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let BufResult(write_result, _) =
+            write_all_with_timeout(&mut stream, command, Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+        write_result.unwrap();
+
+        server_task.await
+    }
+
     #[compio::test]
     async fn curve_server_rejects_hello_with_unsupported_version() {
         let client_short = CurveKeyPair::generate();
@@ -1099,6 +1139,26 @@ mod tests {
         assert!(
             result.is_err(),
             "CURVE server accepted a HELLO command with an all-zero unauthenticated client proof"
+        );
+    }
+
+    #[compio::test]
+    async fn curve_server_rejects_initiate_without_client_proof() {
+        let initiate = rfc_curve_initiate();
+        let result = server_recv_initiate_result(initiate, true).await;
+        assert!(
+            result.is_err(),
+            "CURVE server accepted an INITIATE command with an all-zero unauthenticated client proof"
+        );
+    }
+
+    #[compio::test]
+    async fn curve_server_rejects_initiate_before_hello() {
+        let initiate = rfc_curve_initiate();
+        let result = server_recv_initiate_result(initiate, false).await;
+        assert!(
+            result.is_err(),
+            "CURVE server accepted INITIATE before a HELLO established the client short-term key"
         );
     }
 
