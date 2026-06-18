@@ -231,6 +231,9 @@ impl ZapRequest {
 
         let version =
             String::from_utf8(frames[0].to_vec()).map_err(|_| "Invalid version string")?;
+        if version != ZAP_VERSION {
+            return Err("Unsupported ZAP request version".to_string());
+        }
         let request_id = String::from_utf8(frames[1].to_vec()).map_err(|_| "Invalid request ID")?;
         let domain = String::from_utf8(frames[2].to_vec()).map_err(|_| "Invalid domain string")?;
         let address =
@@ -347,6 +350,9 @@ impl ZapResponse {
 
         let version =
             String::from_utf8(frames[0].to_vec()).map_err(|_| "Invalid version string")?;
+        if version != ZAP_VERSION {
+            return Err("Unsupported ZAP response version".to_string());
+        }
         let request_id = String::from_utf8(frames[1].to_vec()).map_err(|_| "Invalid request ID")?;
 
         let status_str =
@@ -446,6 +452,25 @@ mod tests {
     }
 
     #[test]
+    fn zap_request_decode_rejects_wrong_protocol_version() {
+        let frames = vec![
+            Bytes::from("0.9"),
+            Bytes::from("123"),
+            Bytes::from("test"),
+            Bytes::from("127.0.0.1:5555"),
+            Bytes::from("client1"),
+            Bytes::from("PLAIN"),
+            Bytes::from("admin"),
+            Bytes::from("password"),
+        ];
+
+        assert!(
+            ZapRequest::decode(&frames).is_err(),
+            "ZAP accepted an authentication request with an unsupported protocol version"
+        );
+    }
+
+    #[test]
     fn test_zap_response_success() {
         let response = ZapResponse::success("123", "testuser");
         let frames = response.encode();
@@ -465,6 +490,23 @@ mod tests {
         assert_eq!(decoded.status_code, ZapStatus::Failure);
         assert_eq!(decoded.status_text, "Invalid credentials");
         assert!(decoded.user_id.is_empty());
+    }
+
+    #[test]
+    fn zap_response_decode_rejects_wrong_protocol_version() {
+        let frames = vec![
+            Bytes::from("0.9"),
+            Bytes::from("123"),
+            Bytes::from("200"),
+            Bytes::from("OK"),
+            Bytes::from("admin"),
+            Bytes::new(),
+        ];
+
+        assert!(
+            ZapResponse::decode(&frames).is_err(),
+            "ZAP accepted an authentication success response with an unsupported protocol version"
+        );
     }
 
     #[test]
