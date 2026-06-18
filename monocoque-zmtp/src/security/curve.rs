@@ -266,7 +266,7 @@ pub struct CurveClient {
     client_keypair: CurveKeyPair,
     /// Server's long-term public key  -  needed to verify the WELCOME message signature
     /// when full CurveZMQ server authentication is implemented.
-    _server_public: CurvePublicKey,
+    server_public: CurvePublicKey,
     /// Client's short-term (ephemeral) key pair
     client_short_keypair: CurveKeyPair,
     /// Server's short-term public key (received in WELCOME)
@@ -285,7 +285,7 @@ impl CurveClient {
     pub fn new(client_keypair: CurveKeyPair, server_public: CurvePublicKey) -> Self {
         Self {
             client_keypair,
-            _server_public: server_public,
+            server_public,
             client_short_keypair: CurveKeyPair::generate(),
             server_short_public: None,
             send_nonce: 0,
@@ -383,6 +383,9 @@ impl CurveClient {
 
         let mut key_array = [0u8; CURVE_KEY_SIZE];
         key_array.copy_from_slice(&server_short_key);
+        if key_array == [0u8; CURVE_KEY_SIZE] || key_array != *self.server_public.as_bytes() {
+            return Err(ZmtpError::Protocol);
+        }
         self.server_short_public = Some(CurvePublicKey::from_bytes(key_array));
 
         // Read encrypted cookie (96 bytes)
@@ -1082,6 +1085,40 @@ mod tests {
             replay_result.is_err(),
             "CURVE accepted the same encrypted MESSAGE counter twice"
         );
+    }
+
+    #[compio::test]
+    async fn curve_client_rejects_handshake_from_unconfigured_server_key() {
+        use compio::net::{TcpListener, TcpStream};
+        use compio::runtime;
+        use std::time::Duration;
+
+        let expected_server = CurveKeyPair::generate();
+        let attacker_server = CurveKeyPair::generate();
+        let client_keypair = CurveKeyPair::generate();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut server = CurveServer::new(attacker_server);
+            let _ = server
+                .handshake(&mut stream, Some(Duration::from_secs(1)))
+                .await;
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut client = CurveClient::new(client_keypair, expected_server.public);
+        let result = client
+            .handshake(&mut stream, Some(Duration::from_secs(1)))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "CURVE client completed a handshake with a server whose key did not match the configured server public key"
+        );
+
+        let _ = peer_task.await;
     }
 
     #[test]
