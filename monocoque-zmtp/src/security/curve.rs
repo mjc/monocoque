@@ -461,6 +461,12 @@ impl CurveClient {
             warn!("[CURVE CLIENT] Invalid READY header");
             return Err(ZmtpError::Protocol);
         }
+        let trailing = vec![0u8; 1];
+        match compio::time::timeout(Duration::from_millis(1), stream.read(trailing)).await {
+            Ok(BufResult(Ok(0), _)) | Err(_) => return Err(ZmtpError::Protocol),
+            Ok(BufResult(Ok(_), _)) => {}
+            Ok(BufResult(Err(_), _)) => return Err(ZmtpError::Protocol),
+        }
 
         // Compute shared secret for message encryption
         let server_short_public = self.server_short_public.ok_or(ZmtpError::Protocol)?;
@@ -1116,6 +1122,40 @@ mod tests {
         assert!(
             result.is_err(),
             "CURVE client completed a handshake with a server whose key did not match the configured server public key"
+        );
+
+        let _ = peer_task.await;
+    }
+
+    #[compio::test]
+    async fn curve_client_rejects_ready_without_server_proof() {
+        use compio::buf::BufResult;
+        use compio::net::{TcpListener, TcpStream};
+        use compio::runtime;
+        use monocoque_core::timeout::write_all_with_timeout;
+
+        let client_keypair = CurveKeyPair::generate();
+        let server_keypair = CurveKeyPair::generate();
+        let mut client = CurveClient::new(client_keypair, server_keypair.public);
+        client.server_short_public = Some(server_keypair.public);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let BufResult(write_result, _) =
+                write_all_with_timeout(&mut stream, CURVE_READY.to_vec(), None)
+                    .await
+                    .unwrap();
+            write_result.unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let result = client.recv_ready(&mut stream, None).await;
+
+        assert!(
+            result.is_err(),
+            "CURVE client accepted a bare READY command without authenticated server proof"
         );
 
         let _ = peer_task.await;
