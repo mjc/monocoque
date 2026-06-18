@@ -4,8 +4,8 @@
 /// ZAP handlers run on inproc://zeromq.zap.01 and process authentication
 /// requests from server sockets.
 use crate::security::plain::PlainAuthHandler;
-use crate::security::zap::{ZapMechanism, ZapRequest, ZapResponse};
-use crate::{inproc_stream::InprocStream, DealerSocket};
+use crate::security::zap::{ZAP_VERSION, ZapMechanism, ZapRequest, ZapResponse};
+use crate::{DealerSocket, inproc_stream::InprocStream};
 use monocoque_core::options::SocketOptions;
 use std::io;
 use std::sync::Arc;
@@ -50,6 +50,13 @@ impl<H: PlainAuthHandler> DefaultZapHandler<H> {
 #[async_trait::async_trait(?Send)]
 impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
     async fn authenticate(&self, request: &ZapRequest) -> ZapResponse {
+        if request.version != ZAP_VERSION {
+            return ZapResponse::failure(
+                request.request_id.clone(),
+                "Unsupported ZAP request version",
+            );
+        }
+
         match request.mechanism {
             ZapMechanism::Null => {
                 // NULL mechanism - always accept
@@ -250,25 +257,46 @@ pub fn start_default_zap_server<H: PlainAuthHandler + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::plain::StaticPlainHandler;
     use crate::security::ZapStatus;
+    use crate::security::curve::CurveKeyPair;
+    use crate::security::plain::StaticPlainHandler;
     use bytes::Bytes;
+
+    fn zap_request(mechanism: ZapMechanism, credentials: Vec<Bytes>) -> ZapRequest {
+        ZapRequest {
+            version: "1.0".to_string(),
+            request_id: "request".to_string(),
+            domain: "global".to_string(),
+            address: "127.0.0.1".to_string(),
+            identity: Bytes::new(),
+            mechanism,
+            credentials,
+        }
+    }
+
+    fn plain_request(credentials: Vec<Bytes>) -> ZapRequest {
+        zap_request(ZapMechanism::Plain, credentials)
+    }
+
+    fn curve_request(credentials: Vec<Bytes>) -> ZapRequest {
+        zap_request(ZapMechanism::Curve, credentials)
+    }
+
+    fn default_handler(accept_curve: bool) -> DefaultZapHandler<StaticPlainHandler> {
+        DefaultZapHandler::new(Arc::new(StaticPlainHandler::new()), accept_curve)
+    }
+
+    fn default_plain_handler() -> DefaultZapHandler<StaticPlainHandler> {
+        let mut plain_handler = StaticPlainHandler::new();
+        plain_handler.add_user("admin", "secret");
+        DefaultZapHandler::new(Arc::new(plain_handler), true)
+    }
 
     #[test]
     fn test_default_zap_handler_null() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, true);
-
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "1".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Null,
-                credentials: vec![],
-            };
+            let handler = default_handler(true);
+            let request = zap_request(ZapMechanism::Null, vec![]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Success);
@@ -278,19 +306,8 @@ mod tests {
     #[test]
     fn test_default_zap_handler_plain_success() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut plain_handler = StaticPlainHandler::new();
-            plain_handler.add_user("admin", "secret");
-            let handler = DefaultZapHandler::new(Arc::new(plain_handler), true);
-
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "2".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Plain,
-                credentials: vec![Bytes::from("admin"), Bytes::from("secret")],
-            };
+            let handler = default_plain_handler();
+            let request = plain_request(vec![Bytes::from("admin"), Bytes::from("secret")]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Success);
@@ -299,20 +316,26 @@ mod tests {
     }
 
     #[test]
+    fn default_zap_handler_rejects_unsupported_request_version() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_plain_handler();
+            let mut request = plain_request(vec![Bytes::from("admin"), Bytes::from("secret")]);
+            request.version = "0.9".to_string();
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler accepted credentials from an unsupported ZAP request version"
+            );
+        });
+    }
+
+    #[test]
     fn test_default_zap_handler_plain_failure() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, true);
-
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "3".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Plain,
-                credentials: vec![Bytes::from("admin"), Bytes::from("wrong")],
-            };
+            let handler = default_handler(true);
+            let request = plain_request(vec![Bytes::from("admin"), Bytes::from("wrong")]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Failure);
@@ -322,19 +345,10 @@ mod tests {
     #[test]
     fn test_default_zap_handler_curve_success() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, true);
+            let handler = default_handler(true);
 
-            let public_key = [0u8; 32];
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "4".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Curve,
-                credentials: vec![Bytes::copy_from_slice(&public_key)],
-            };
+            let public_key = CurveKeyPair::generate().public;
+            let request = curve_request(vec![Bytes::copy_from_slice(public_key.as_bytes())]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Success);
@@ -344,19 +358,10 @@ mod tests {
     #[test]
     fn test_default_zap_handler_curve_disabled() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, false);
+            let handler = default_handler(false);
 
             let public_key = [0u8; 32];
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "5".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Curve,
-                credentials: vec![Bytes::copy_from_slice(&public_key)],
-            };
+            let request = curve_request(vec![Bytes::copy_from_slice(&public_key)]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Failure);
@@ -381,7 +386,11 @@ mod tests {
     impl ZapHandler for IpDenyListHandler {
         async fn authenticate(&self, request: &ZapRequest) -> ZapResponse {
             // Reject if the peer address starts with any denied IP prefix
-            if self.denied_ips.iter().any(|ip| request.address.starts_with(ip.as_str())) {
+            if self
+                .denied_ips
+                .iter()
+                .any(|ip| request.address.starts_with(ip.as_str()))
+            {
                 return ZapResponse::failure(
                     request.request_id.clone(),
                     format!("Address {} is blocked", request.address),
