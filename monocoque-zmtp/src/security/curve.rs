@@ -275,7 +275,7 @@ pub struct CurveClient {
     send_nonce: u64,
     /// Receive nonce counter  -  needed for replay-attack detection when message
     /// authentication is fully implemented.
-    _recv_nonce: u64,
+    recv_nonce: u64,
     /// Encryption box for messages (after READY)
     message_box: Option<CurveBox>,
 }
@@ -289,7 +289,7 @@ impl CurveClient {
             client_short_keypair: CurveKeyPair::generate(),
             server_short_public: None,
             send_nonce: 0,
-            _recv_nonce: 0,
+            recv_nonce: 0,
             message_box: None,
         }
     }
@@ -507,9 +507,19 @@ impl CurveClient {
         // Reconstruct nonce
         let mut nonce = [0u8; CURVE_NONCE_SIZE];
         nonce[..16].copy_from_slice(b"CurveZMQMESSAGES");
+        let counter = u64::from_be_bytes(
+            parts
+                .short_nonce
+                .try_into()
+                .map_err(|_| CurveError::ProtocolViolation)?,
+        );
+        if counter < self.recv_nonce {
+            return Err(CurveError::ProtocolViolation);
+        }
         nonce[16..].copy_from_slice(parts.short_nonce);
 
         let plaintext = message_box.decrypt(parts.ciphertext, &nonce)?;
+        self.recv_nonce = counter.saturating_add(1);
         Ok(Bytes::from(plaintext))
     }
 }
@@ -529,7 +539,7 @@ pub struct CurveServer {
     send_nonce: u64,
     /// Receive nonce counter  -  needed for replay-attack detection when message
     /// authentication is fully implemented.
-    _recv_nonce: u64,
+    recv_nonce: u64,
     /// Encryption box for messages (after READY)
     message_box: Option<CurveBox>,
 }
@@ -543,7 +553,7 @@ impl CurveServer {
             client_short_public: None,
             client_public: None,
             send_nonce: 0,
-            _recv_nonce: 0,
+            recv_nonce: 0,
             message_box: None,
         }
     }
@@ -775,9 +785,19 @@ impl CurveServer {
         // Reconstruct nonce
         let mut nonce = [0u8; CURVE_NONCE_SIZE];
         nonce[..16].copy_from_slice(b"CurveZMQMESSAGEC");
+        let counter = u64::from_be_bytes(
+            parts
+                .short_nonce
+                .try_into()
+                .map_err(|_| CurveError::ProtocolViolation)?,
+        );
+        if counter < self.recv_nonce {
+            return Err(CurveError::ProtocolViolation);
+        }
         nonce[16..].copy_from_slice(parts.short_nonce);
 
         let plaintext = message_box.decrypt(parts.ciphertext, &nonce)?;
+        self.recv_nonce = counter.saturating_add(1);
         Ok(Bytes::from(plaintext))
     }
 }
@@ -1033,6 +1053,35 @@ mod tests {
         let plaintext = client.decrypt_message(&frame).unwrap();
 
         assert_eq!(plaintext.as_ref(), b"server message");
+    }
+
+    #[test]
+    fn decrypt_message_rejects_replayed_message_counter() {
+        let shared_secret = [42u8; CURVE_KEY_SIZE];
+        let box_ = CurveBox::new(&shared_secret);
+
+        let mut nonce = [0u8; CURVE_NONCE_SIZE];
+        nonce[..16].copy_from_slice(b"CurveZMQMESSAGES");
+        nonce[16..].copy_from_slice(&1u64.to_be_bytes());
+
+        let ciphertext = box_.encrypt(b"server message", &nonce).unwrap();
+        let mut frame = BytesMut::new();
+        frame.extend_from_slice(CURVE_MESSAGE);
+        frame.extend_from_slice(&nonce[16..]);
+        frame.extend_from_slice(&ciphertext);
+
+        let client_keypair = CurveKeyPair::generate();
+        let server_public = CurveKeyPair::generate().public;
+        let mut client = CurveClient::new(client_keypair, server_public);
+        client.message_box = Some(CurveBox::new(&shared_secret));
+
+        client.decrypt_message(&frame).unwrap();
+        let replay_result = client.decrypt_message(&frame);
+
+        assert!(
+            replay_result.is_err(),
+            "CURVE accepted the same encrypted MESSAGE counter twice"
+        );
     }
 
     #[test]
