@@ -39,6 +39,7 @@ use crate::codec::ZmtpError;
 use crate::security::zap::{ZapMechanism, ZapRequest, ZapStatus};
 use bytes::{Bytes, BytesMut};
 use compio::io::{AsyncRead, AsyncWrite};
+use std::fmt;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -49,12 +50,21 @@ const PLAIN_ERROR: &[u8] = b"\x05ERROR";
 const TRAILING_BYTE_CHECK_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// PLAIN client credentials
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PlainCredentials {
     /// Plaintext username.
     pub username: String,
     /// Plaintext password.
     pub password: String,
+}
+
+impl fmt::Debug for PlainCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlainCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PlainCredentials {
@@ -97,9 +107,17 @@ pub trait PlainAuthHandler {
 ///
 /// Validates against a static HashMap of username → password.
 /// For production use, implement PlainAuthHandler with database lookup.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StaticPlainHandler {
     credentials: std::collections::HashMap<String, String>,
+}
+
+impl fmt::Debug for StaticPlainHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StaticPlainHandler")
+            .field("credential_count", &self.credentials.len())
+            .finish()
+    }
 }
 
 impl StaticPlainHandler {
@@ -541,6 +559,19 @@ mod tests {
         assert!(
             result.is_err() && response.as_slice() != PLAIN_WELCOME,
             "PLAIN server authenticated a HELLO command with trailing credential bytes"
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_static_plain_handler_passwords() {
+        let mut handler = StaticPlainHandler::new();
+        handler.add_user("alice", "handler-password");
+
+        let debug = format!("{handler:?}");
+
+        assert!(
+            !debug.contains("handler-password"),
+            "StaticPlainHandler Debug output exposes stored PLAIN passwords"
         );
     }
 }

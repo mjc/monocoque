@@ -30,6 +30,7 @@
 
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonic counter used to generate unique ZAP request IDs.
@@ -119,7 +120,7 @@ impl ZapStatus {
 }
 
 /// ZAP authentication request
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ZapRequest {
     /// Version (always "1.0")
     pub version: String,
@@ -135,6 +136,29 @@ pub struct ZapRequest {
     pub mechanism: ZapMechanism,
     /// Mechanism-specific credentials
     pub credentials: Vec<Bytes>,
+}
+
+impl fmt::Debug for ZapRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let credentials = if self.credentials.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[<{} credential frame(s) redacted>]",
+                self.credentials.len()
+            )
+        };
+
+        f.debug_struct("ZapRequest")
+            .field("version", &self.version)
+            .field("request_id", &self.request_id)
+            .field("domain", &self.domain)
+            .field("address", &self.address)
+            .field("identity", &self.identity)
+            .field("mechanism", &self.mechanism)
+            .field("credentials", &credentials)
+            .finish()
+    }
 }
 
 impl ZapRequest {
