@@ -64,7 +64,7 @@ impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
             }
             ZapMechanism::Plain => {
                 // Extract username and password
-                if request.credentials.len() < 2 {
+                if request.credentials.len() != 2 {
                     return ZapResponse::failure(request.request_id.clone(), "Missing credentials");
                 }
 
@@ -312,6 +312,25 @@ mod tests {
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Success);
             assert_eq!(response.user_id, "admin");
+        });
+    }
+
+    #[test]
+    fn default_zap_handler_rejects_plain_request_with_extra_credentials() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_plain_handler();
+            let request = plain_request(vec![
+                Bytes::from("admin"),
+                Bytes::from("secret"),
+                Bytes::from("ignored-injected-frame"),
+            ]);
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler authenticated a malformed PLAIN request with extra credential frames"
+            );
         });
     }
 
