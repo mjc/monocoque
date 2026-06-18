@@ -68,8 +68,24 @@ impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
                     return ZapResponse::failure(request.request_id.clone(), "Missing credentials");
                 }
 
-                let username = String::from_utf8_lossy(&request.credentials[0]);
-                let password = String::from_utf8_lossy(&request.credentials[1]);
+                let username = match std::str::from_utf8(&request.credentials[0]) {
+                    Ok(username) => username,
+                    Err(_) => {
+                        return ZapResponse::failure(
+                            request.request_id.clone(),
+                            "Invalid UTF-8 username",
+                        );
+                    }
+                };
+                let password = match std::str::from_utf8(&request.credentials[1]) {
+                    Ok(password) => password,
+                    Err(_) => {
+                        return ZapResponse::failure(
+                            request.request_id.clone(),
+                            "Invalid UTF-8 password",
+                        );
+                    }
+                };
 
                 // Call PLAIN handler
                 match self
@@ -346,6 +362,21 @@ mod tests {
                 response.status_code,
                 ZapStatus::Failure,
                 "Default ZAP handler accepted credentials from an unsupported ZAP request version"
+            );
+        });
+    }
+
+    #[test]
+    fn default_zap_handler_rejects_invalid_utf8_plain_credentials() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_plain_handler();
+            let request = plain_request(vec![Bytes::from(vec![0xff]), Bytes::from("secret")]);
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler authenticated invalid UTF-8 PLAIN credentials after lossy conversion"
             );
         });
     }
