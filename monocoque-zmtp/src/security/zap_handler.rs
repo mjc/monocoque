@@ -119,6 +119,12 @@ impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
                         "Invalid CURVE key length",
                     );
                 }
+                if public_key.iter().all(|&byte| byte == 0) {
+                    return ZapResponse::failure(
+                        request.request_id.clone(),
+                        "Invalid CURVE public key",
+                    );
+                }
 
                 // Use the hex-encoded public key as user_id
                 let user_id = format!("{:x?}", public_key);
@@ -421,6 +427,21 @@ mod tests {
                 response.status_code,
                 ZapStatus::Failure,
                 "Default ZAP handler authenticated a malformed CURVE request with extra credential frames"
+            );
+        });
+    }
+
+    #[test]
+    fn default_zap_handler_rejects_all_zero_curve_public_key() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_handler(true);
+            let request = curve_request(vec![Bytes::copy_from_slice(&[0u8; 32])]);
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler accepted an all-zero CURVE public key"
             );
         });
     }
