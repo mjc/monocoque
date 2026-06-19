@@ -4,8 +4,8 @@
 /// ZAP handlers run on inproc://zeromq.zap.01 and process authentication
 /// requests from server sockets.
 use crate::security::plain::PlainAuthHandler;
-use crate::security::zap::{ZAP_VERSION, ZapMechanism, ZapRequest, ZapResponse};
-use crate::{DealerSocket, inproc_stream::InprocStream};
+use crate::security::zap::{ZapMechanism, ZapRequest, ZapResponse, ZAP_VERSION};
+use crate::{inproc_stream::InprocStream, DealerSocket};
 use monocoque_core::options::SocketOptions;
 use std::io;
 use std::sync::Arc;
@@ -126,9 +126,8 @@ impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
                     );
                 }
 
-                // Use the hex-encoded public key as user_id
-                let user_id = format!("{:x?}", public_key);
-                ZapResponse::success(request.request_id.clone(), user_id)
+                // CURVE accepts the key without synthesizing a user ID.
+                ZapResponse::success(request.request_id.clone(), String::new())
             }
         }
     }
@@ -279,9 +278,9 @@ pub fn start_default_zap_server<H: PlainAuthHandler + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::ZapStatus;
     use crate::security::curve::CurveKeyPair;
     use crate::security::plain::StaticPlainHandler;
+    use crate::security::ZapStatus;
     use bytes::Bytes;
 
     fn zap_request(mechanism: ZapMechanism, credentials: Vec<Bytes>) -> ZapRequest {
@@ -482,10 +481,7 @@ mod tests {
                 .iter()
                 .any(|ip| request.address.starts_with(ip.as_str()))
             {
-                return ZapResponse::failure(
-                    request.request_id.clone(),
-                    format!("Address {} is blocked", request.address),
-                );
+                return ZapResponse::failure(request.request_id.clone(), "Address is blocked");
             }
             ZapResponse::success(request.request_id.clone(), String::new())
         }
