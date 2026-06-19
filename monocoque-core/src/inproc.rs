@@ -1,11 +1,11 @@
-//! In-process transport for zero-copy messaging within the same process.
+//! In-process transport for copy-minimized messaging within the same process.
 //!
 //! The inproc transport provides high-performance communication between sockets
 //! in the same process using channels, without TCP/IP overhead.
 //!
 //! # Features
 //!
-//! - **Zero-copy**: Messages are shared via `Arc<Vec<Bytes>>` between sockets
+//! - **Refcounted sharing**: Messages are shared via `Arc<Vec<Bytes>>` between sockets
 //! - **Thread-safe**: Global registry protected by `DashMap`
 //! - **Fast**: No serialization, network, or syscall overhead
 //! - **`ZeroMQ` compatible**: Uses `inproc://` URI scheme

@@ -2,7 +2,7 @@
 //!
 //! This crate contains the runtime-agnostic core building blocks:
 //! - Pinned / io_uring-safe allocation (`alloc`)
-//! - Zero-copy segmented buffer (`buffer`)
+//! - Segmented buffer with zero-copy fast paths (`buffer`)
 //! - TCP utilities for high-performance networking (`tcp`)
 //! - ROUTER hub + peer map (`router`)
 //! - PUB/SUB core (subscription index + hub) (`pubsub`)

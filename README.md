@@ -16,7 +16,7 @@
 
 **Monocoque** is a high-performance messaging kernel that outperforms libzmq while preserving Rust's memory safety guarantees. It provides:
 
--   **Zero-copy message handling** using `Bytes` with refcount-based fanout
+-   **Copy-minimized message handling** using `Bytes` with refcount-based fanout
 -   **Syscall-minimal IO** via `io_uring` (through `compio`)
 -   **ZeroMQ 3.1 protocol compatibility** (ZMTP 3.1)
 -   **Runtime-agnostic architecture** (not coupled to Tokio)
@@ -47,7 +47,7 @@ This directly parallels Monocoque's architecture:
 | **Load-bearing structure** | Each layer (IO → Protocol → Routing) is self-contained and correct by construction, not defensively checked             |
 | **Carbon fiber strength**  | Type system enforces correctness - `SlabMut` → `Bytes` transition is one-way, preventing use-after-free at compile time |
 | **Crash safety cell**      | `unsafe` isolated to `alloc/` module - failure boundary is explicit and auditable                                       |
-| **Minimal weight**         | Zero-copy everywhere - `Bytes::clone()` bumps refcounts, never copies payloads                                          |
+| **Minimal weight**         | `Bytes::clone()` bumps refcounts, never copies payloads on fanout paths                                                  |
 | **Predictable rigidity**   | Sans-IO state machines are deterministic - same input always produces same output, enabling exhaustive testing          |
 
 Just as an F1 monocoque achieves safety through **structural correctness** rather than protective padding, this runtime achieves performance through **architectural correctness** rather than optimization tricks that compromise safety.
@@ -89,7 +89,7 @@ Monocoque is built as a layered system, each layer providing clean abstractions:
     │                  │ │              │ │ • Small/Large  │
     │ • Greeting       │ │ • Short/Long │ │ • Latency/     │
     │ • NULL Auth      │ │ • Multipart  │ │   Throughput   │
-    │ • Metadata       │ │ • Zero-copy  │ │                │
+    │ • Metadata       │ │ • Copy-min.  │ │                │
     └──────────────────┘ └──────────────┘ └────────────────┘
                                   │
                                   ▼
@@ -108,7 +108,7 @@ Monocoque is built as a layered system, each layer providing clean abstractions:
     │ • Only unsafe    │ │              │ │ • TCP_NODELAY  │
     │   code in crate  │ │ • Recv buf   │ │ • Unix sockets │
     │ • io_uring mem   │ │ • Frame acc. │ │ • Connect/bind │
-    │ • Zero-copy      │ │ • Reusable   │ │   helpers      │
+    │ • Copy-min.      │ │ • Reusable   │ │   helpers      │
     └──────────────────┘ └──────────────┘ └────────────────┘
                                   │
                                   ▼
@@ -161,11 +161,18 @@ Monocoque is built as a layered system, each layer providing clean abstractions:
 
 2. **Direct Stream I/O**: Each socket owns and directly manages its stream, performing handshake, decoding, and multipart assembly inline.
 
-3. **Zero-Copy by Construction**: All message payloads are `Bytes` - no intermediate allocations or copies.
+3. **Copy-minimized by Construction**: Message payloads are `Bytes`, so the common fanout path avoids extra allocations or copies.
 
 4. **Generic Streams**: Sockets work with any `AsyncRead + AsyncWrite + Unpin` stream, enabling TCP, Unix sockets, or custom transports.
 
 5. **Runtime Independence**: Compatible with compio, Tokio, async-std, or any async runtime.
+
+### Known Copy Boundaries
+
+- **Wire encoding**: Multipart frames are encoded into a contiguous wire buffer before fanout.
+- **Fragmented receive reassembly**: Multi-segment reads are copied into a contiguous buffer.
+- **Stream adapters**: `inproc` and other bridge layers copy when they translate between byte buffers and channels.
+- **Convenience builders**: String and numeric helpers allocate or copy when constructing frames from owned values.
 
 ---
 
@@ -195,7 +202,7 @@ Monocoque has **all phases complete** and is production-ready.
 ### ✅ Implemented & Working
 
 -   **Direct Stream I/O**: Each socket manages its own stream with inline handshake and decoding (Phase 0)
--   **IoBytes Zero-Copy Wrapper**: Eliminates `.to_vec()` memcpy on writes (~10-30% CPU reduction)
+-   **IoBytes wrapper**: Eliminates `.to_vec()` memcpy on writes (~10-30% CPU reduction on owned-byte paths)
 -   **ZMTP 3.1 Framing**: Short/long frames, fragmentation support (Phase 1)
 -   **NULL Authentication**: Greeting + handshake with Socket-Type metadata (Phase 1)
 -   **Sans-IO State Machine**: `ZmtpSession` with deterministic testing (Phase 1)
@@ -593,7 +600,7 @@ Monocoque is in early development. Contributions are welcome, especially:
 
 **Stretch Goals** (optional, diminishing returns):
 
--   [ ] **io_uring fixed buffers**: pre-register buffer pool with the kernel (`IORING_OP_READ_FIXED`/`WRITE_FIXED`) to eliminate the remaining kernel-boundary copy per read. Requires dropping below `compio` to `io-uring-sys`. Estimated gain: 5–15% latency at already-21μs baseline. ~2–3 weeks.
+-   [ ] **io_uring fixed buffers**: pre-register buffer pool with the kernel (`IORING_OP_READ_FIXED`/`WRITE_FIXED`) to remove the remaining kernel-boundary copy on read paths where the runtime can use fixed buffers. Requires dropping below `compio` to `io-uring-sys`. Estimated gain: 5–15% latency at already-21μs baseline. ~2–3 weeks.
 -   [ ] **Prefix trie for topic matching**: current matching is a linear scan over `Vec<Subscription>` with slice comparison (already compiler-vectorized). A real trie is only worthwhile at 100+ concurrent subscriptions with deep topic hierarchies (e.g. `trading.fx.pair.EURUSD.bid`). ~2–3 weeks when subscriber counts justify it.
 -   [ ] **Concurrent PUB fanout**: current subscriber fanout in `PubSocket` is sequential with a per-subscriber timeout. For deployments with many subscribers (>100), concurrent sends via spawned tasks would prevent one slow subscriber from delaying others. Not needed until subscriber count warrants it.
 
@@ -634,7 +641,7 @@ monocoque/                        # Workspace root
 │
 ├── monocoque-core/              # 🔒 INTERNAL - Protocol-agnostic primitives
 │   └── src/
-│       ├── message.rs          # Zero-copy message type
+│       ├── message.rs          # Bytes-backed message type
 │       ├── options.rs          # Socket configuration
 │       └── socket_type.rs      # Socket type enum
 │

@@ -51,7 +51,7 @@ pub enum RepState {
 /// - Direct I/O with buffer reuse
 /// - `TCP_NODELAY` enabled
 /// - ~10µs latency per round-trip
-/// - Zero-copy where possible
+/// - Copy-minimized where possible
 ///
 /// # Example
 ///

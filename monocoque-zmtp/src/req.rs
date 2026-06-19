@@ -5,7 +5,7 @@
 //! # Performance Characteristics
 //!
 //! - **No channel overhead**: Direct stream access
-//! - **Zero-copy**: Arena-backed allocation with io_uring owned buffers
+//! - **Copy-minimized**: Arena-backed allocation with io_uring owned buffers
 //! - **Efficient I/O**: compio's io_uring for minimal syscall overhead
 //!
 //! # Architecture
@@ -66,7 +66,7 @@ pub enum ReqState {
 /// High-performance REQ socket using direct stream I/O.
 ///
 /// This implementation uses compio's native owned-buffer API with
-/// zero-copy arena allocation for maximum performance.
+/// copy-minimized arena allocation for maximum performance.
 ///
 /// # State Machine
 ///

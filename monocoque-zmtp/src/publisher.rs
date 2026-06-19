@@ -4,7 +4,7 @@
 /// subscribers with minimal overhead using:
 /// - **Worker pool architecture**: Multiple threads handle subscribers in parallel
 /// - **io_uring per worker**: Each worker thread runs its own compio runtime with io_uring
-/// - **Zero-copy message broadcasting**: Shared Arc<Bytes> across all workers
+/// - **Refcounted message broadcasting**: Shared Arc<Bytes> across all workers
 /// - **Lock-free subscription updates**: Per-subscriber subscription state with RwLock
 ///
 /// ## Architecture:
@@ -35,7 +35,7 @@
 /// - O(1) subscriber add (via channel to worker)
 /// - O(k/w) broadcast per worker where k=subscribers, w=workers (parallel)
 /// - O(n) topic matching where n=topic prefix length
-/// - Zero-copy via Arc<Bytes> for message data
+/// - Refcounted sharing via Arc<Bytes> for message data
 use bytes::Bytes;
 use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
 use flume::{Receiver, Sender};
@@ -446,7 +446,7 @@ impl PubSocket {
 
     /// Broadcast message to all matching subscribers across all workers.
     ///
-    /// Message is shared via Arc for zero-copy distribution to workers.
+    /// Message is shared via Arc for refcounted distribution to workers.
     /// Each worker filters by subscription prefix and delivers to matching subscribers only.
     pub async fn send(&mut self, msg: Vec<Bytes>) -> io::Result<()> {
         // Check poison flag first
@@ -466,7 +466,7 @@ impl PubSocket {
 
         trace!("[PUB] Broadcasting to {} workers", self.workers.len());
 
-        // Wrap message in Arc for zero-copy sharing across workers
+        // Wrap message in Arc for refcounted sharing across workers
         let message = Arc::new(msg);
 
         // Try to send to each worker. Use try_send (non-blocking) so a slow

@@ -66,7 +66,7 @@
 //!
 //! ## Performance
 //!
-//! - **Zero-copy**: Uses `bytes::Bytes` for refcounted message buffers
+//! - **Copy-minimized**: Uses `bytes::Bytes` for refcounted message buffers
 //! - **`io_uring`**: Native Linux async I/O (via `compio`)
 //! - **Lock-free**: SPSC queues, no shared mutable state in hot paths
 //! - **Sans-IO**: Protocol logic is pure, testable, and runtime-agnostic

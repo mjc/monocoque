@@ -41,7 +41,7 @@
 //!
 //! ## Features
 //!
-//! - **Zero-copy**: Messages use `Bytes` for efficient sharing
+//! - **Copy-minimized**: Messages use `Bytes` for efficient sharing
 //! - **`io_uring`**: High-performance async I/O via `compio`
 
 // Pedantic lints configuration
