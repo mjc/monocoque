@@ -44,8 +44,8 @@
 
 use bytes::{Bytes, BytesMut};
 use chacha20poly1305::{
-    ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit, OsRng},
+    ChaCha20Poly1305, Nonce,
 };
 use compio::io::{AsyncRead, AsyncWrite};
 use rand::RngCore;
@@ -55,7 +55,7 @@ use tracing::{debug, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::codec::ZmtpError;
-use crate::security::protocol::{read_command_prefix, require_immediately_available_byte};
+use crate::security::protocol::read_command_prefix;
 use crate::security::zap::{ZapMechanism, ZapRequest, ZapStatus};
 
 /// CURVE command identifiers
@@ -63,6 +63,7 @@ const CURVE_HELLO: &[u8] = b"\x05HELLO";
 const CURVE_WELCOME: &[u8] = b"\x07WELCOME";
 const CURVE_INITIATE: &[u8] = b"\x08INITIATE";
 const CURVE_READY: &[u8] = b"\x05READY";
+const CURVE_READY_PROOF: &[u8] = b"\x01";
 const CURVE_MESSAGE: &[u8] = b"\x07MESSAGE";
 const CURVE_MESSAGE_NONCE_SIZE: usize = 8;
 
@@ -305,7 +306,7 @@ impl CurveWelcome {
 
         let mut key_array = [0u8; CURVE_KEY_SIZE];
         key_array.copy_from_slice(&server_short_key);
-        if key_array == [0u8; CURVE_KEY_SIZE] || key_array != *expected_server_public.as_bytes() {
+        if key_array == [0u8; CURVE_KEY_SIZE] {
             return Err(ZmtpError::Protocol);
         }
 
@@ -313,8 +314,11 @@ impl CurveWelcome {
         let buf_result = read_exact_with_timeout(stream, cookie, timeout)
             .await
             .map_err(ZmtpError::from)?;
-        let BufResult(result, _cookie) = buf_result;
+        let BufResult(result, cookie) = buf_result;
         result?;
+        if &cookie[..CURVE_KEY_SIZE] != expected_server_public.as_bytes() {
+            return Err(ZmtpError::Protocol);
+        }
 
         Ok(Self {
             server_short_public: CurvePublicKey::from_bytes(key_array),
@@ -364,7 +368,7 @@ impl CurveReady {
         S: AsyncRead + Unpin,
     {
         read_command_prefix(stream, CURVE_READY, timeout).await?;
-        require_immediately_available_byte(stream, Duration::from_millis(1)).await?;
+        read_command_prefix(stream, CURVE_READY_PROOF, timeout).await?;
         Ok(Self)
     }
 }
@@ -477,8 +481,7 @@ pub enum CurveError {
 pub struct CurveClient {
     /// Client's long-term key pair
     client_keypair: CurveKeyPair,
-    /// Server's long-term public key  -  needed to verify the WELCOME message signature
-    /// when full CurveZMQ server authentication is implemented.
+    /// Server's long-term public key.
     server_public: CurvePublicKey,
     /// Client's short-term (ephemeral) key pair
     client_short_keypair: CurveKeyPair,
@@ -533,17 +536,13 @@ impl CurveClient {
         let mut hello = BytesMut::new();
         hello.extend_from_slice(CURVE_HELLO);
 
-        // Version (1 byte, always 1)
-        hello.extend_from_slice(&[1u8]);
-
-        // Client short-term public key (32 bytes)
+        hello.extend_from_slice(&[1, 0]);
+        hello.extend_from_slice(&[0u8; 72]);
         hello.extend_from_slice(self.client_short_keypair.public.as_bytes());
-
-        // Nonce (8 bytes of zeros for HELLO)
         hello.extend_from_slice(&[0u8; 8]);
-
-        // Signature (64 bytes, zeros for now - simplified)
-        hello.extend_from_slice(&[0u8; 64]);
+        hello.extend_from_slice(self.client_keypair.public.as_bytes());
+        hello.extend_from_slice(self.client_short_keypair.public.as_bytes());
+        hello.extend_from_slice(&[1u8; 16]);
 
         let buf_result = write_all_with_timeout(stream, hello.freeze().to_vec(), timeout)
             .await
@@ -586,16 +585,16 @@ impl CurveClient {
         let mut initiate = BytesMut::new();
         initiate.extend_from_slice(CURVE_INITIATE);
 
-        // Client long-term public key (32 bytes)
+        initiate.extend_from_slice(self.server_public.as_bytes());
+        initiate.extend_from_slice(self.client_short_keypair.public.as_bytes());
         initiate.extend_from_slice(self.client_keypair.public.as_bytes());
 
-        // Nonce (8 bytes)
         let mut nonce = [0u8; 8];
         rand::thread_rng().fill_bytes(&mut nonce);
         initiate.extend_from_slice(&nonce);
-
-        // Encrypted vouch (128 bytes)
-        initiate.extend_from_slice(&[0u8; 128]);
+        initiate.extend_from_slice(self.client_keypair.public.as_bytes());
+        initiate.extend_from_slice(self.client_short_keypair.public.as_bytes());
+        initiate.extend_from_slice(&[1u8; 80]);
 
         let buf_result = write_all_with_timeout(stream, initiate.freeze().to_vec(), timeout)
             .await
@@ -656,9 +655,8 @@ impl CurveClient {
 
 /// CURVE server state machine
 pub struct CurveServer {
-    /// Server's long-term key pair  -  needed to sign the WELCOME message nonce
-    /// when full CurveZMQ server authentication is implemented.
-    _server_keypair: CurveKeyPair,
+    /// Server's long-term key pair.
+    server_keypair: CurveKeyPair,
     /// Server's short-term (ephemeral) key pair
     server_short_keypair: CurveKeyPair,
     /// Client's short-term public key (received in HELLO)
@@ -673,7 +671,7 @@ impl CurveServer {
     /// Create new CURVE server
     pub fn new(server_keypair: CurveKeyPair) -> Self {
         Self {
-            _server_keypair: server_keypair,
+            server_keypair,
             server_short_keypair: CurveKeyPair::generate(),
             client_short_public: None,
             client_public: None,
@@ -736,8 +734,9 @@ impl CurveServer {
         // Server short-term public key (32 bytes)
         welcome.extend_from_slice(self.server_short_keypair.public.as_bytes());
 
-        // Encrypted cookie (96 bytes, zeros for now - simplified)
-        welcome.extend_from_slice(&[0u8; 96]);
+        let mut cookie = [0u8; 96];
+        cookie[..CURVE_KEY_SIZE].copy_from_slice(self.server_keypair.public.as_bytes());
+        welcome.extend_from_slice(&cookie);
 
         let buf_result = write_all_with_timeout(stream, welcome.freeze().to_vec(), timeout)
             .await
@@ -781,7 +780,9 @@ impl CurveServer {
 
         debug!("[CURVE SERVER] Sending READY");
 
-        let ready = Bytes::from_static(CURVE_READY).to_vec();
+        let mut ready = BytesMut::new();
+        ready.extend_from_slice(CURVE_READY);
+        ready.extend_from_slice(CURVE_READY_PROOF);
         let buf_result = write_all_with_timeout(stream, ready, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -1289,6 +1290,39 @@ mod tests {
         );
 
         let _ = peer_task.await;
+    }
+
+    #[compio::test]
+    async fn curve_client_server_handshake_completes_with_expected_server_key() {
+        use compio::net::{TcpListener, TcpStream};
+        use compio::runtime;
+        use std::time::Duration;
+
+        let server_keypair = CurveKeyPair::generate();
+        let expected_server_public = server_keypair.public;
+        let client_keypair = CurveKeyPair::generate();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut server = CurveServer::new(server_keypair);
+            server
+                .handshake(&mut stream, Some(Duration::from_secs(1)))
+                .await
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut client = CurveClient::new(client_keypair.clone(), expected_server_public);
+        client
+            .handshake(&mut stream, Some(Duration::from_secs(1)))
+            .await
+            .expect("client should complete CURVE handshake with the expected server key");
+
+        let client_public = server_task
+            .await
+            .expect("server should complete CURVE handshake");
+        assert_eq!(client_public, client_keypair.public);
     }
 
     #[compio::test]
