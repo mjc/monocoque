@@ -85,22 +85,25 @@ async fn peer_reader(
 ) {
     use compio::buf::BufResult;
     use compio::io::AsyncRead;
+    use monocoque_core::alloc::IoArena;
 
     // Connection notification
     let _ = inbound
         .send_async(vec![routing_id.clone(), Bytes::new(), Bytes::new()])
         .await;
 
+    let mut arena = IoArena::new();
     loop {
-        let buf = vec![0u8; 8192];
-        let BufResult(result, buf) = reader.read(buf).await;
+        let slab = arena.alloc_mut(8192);
+        let BufResult(result, slab) = reader.read(slab).await;
         match result {
             Ok(0) => {
                 debug!("[STREAM] Peer {:?} disconnected (EOF)", routing_id);
                 break;
             }
             Ok(n) => {
-                let data = Bytes::copy_from_slice(&buf[..n]);
+                debug_assert!(n <= 8192);
+                let data = slab.freeze();
                 trace!("[STREAM] Received {} bytes from peer {:?}", n, routing_id);
                 let msg = vec![routing_id.clone(), Bytes::new(), data];
                 if inbound.send_async(msg).await.is_err() {
@@ -124,7 +127,7 @@ async fn peer_writer(mut writer: OwnedWriteHalf<TcpStream>, outbound: Receiver<B
     use compio::io::AsyncWriteExt;
 
     while let Ok(data) = outbound.recv_async().await {
-        let BufResult(res, _) = writer.write_all(data.to_vec()).await;
+        let BufResult(res, _) = writer.write_all(data).await;
         if res.is_err() {
             break;
         }
@@ -142,7 +145,7 @@ async fn peer_writer(mut writer: OwnedWriteHalf<TcpStream>, outbound: Receiver<B
 /// routing ID; all subsequent sends and receives for that connection use the
 /// same ID to route messages.
 ///
-/// Unlike other socket types, `StreamSocket` performs **no ZMTP handshake**  - 
+/// Unlike other socket types, `StreamSocket` performs **no ZMTP handshake**  -
 /// it speaks plain TCP bytes, making it suitable for bridging to HTTP servers,
 /// legacy services, and command-line tools such as `nc` and `curl`.
 pub struct StreamSocket {
