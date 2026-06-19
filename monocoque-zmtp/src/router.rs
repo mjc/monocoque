@@ -94,7 +94,7 @@ where
             &options,
         )
         .await
-        .map_err(|e| io::Error::other(format!("Handshake failed: {}", e)))?;
+        .map_err(io::Error::other)?;
 
         // Determine peer identity (priority order):
         // 1. connect_routing_id (explicitly assigned by ROUTER)
@@ -111,7 +111,11 @@ where
         } else {
             // Auto-generate identity using counter
             let peer_id = PEER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let id = Bytes::from(format!("\0peer-{}", peer_id));
+            let mut id = String::with_capacity(6 + 20);
+            id.push_str("\0peer-");
+            use std::fmt::Write as _;
+            write!(&mut id, "{peer_id}").expect("writing into String");
+            let id = Bytes::from(id);
             debug!("[ROUTER] Auto-generated identity: {:?}", id);
             id
         };
