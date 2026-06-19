@@ -137,17 +137,20 @@ where
         let payload = payload.freeze();
 
         // ZMTP-frame it (single-frame message)
-        let mut wire = BytesMut::new();
+        let mut wire = BytesMut::with_capacity(payload.len() + 9);
         crate::codec::encode_multipart(&[payload], &mut wire);
         let wire = wire.freeze();
 
-        trace!("[SUB] Sending subscription event ({} wire bytes)", wire.len());
+        trace!(
+            "[SUB] Sending subscription event ({} wire bytes)",
+            wire.len()
+        );
 
-        let stream = self.base.stream.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
-        })?;
-        let data = wire.to_vec();
-        let BufResult(result, _) = stream.write_all(data).await;
+        let stream =
+            self.base.stream.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
+            })?;
+        let BufResult(result, _) = stream.write_all(wire).await;
         result?;
 
         trace!("[SUB] Subscription event sent successfully");

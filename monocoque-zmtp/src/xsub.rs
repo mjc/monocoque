@@ -201,7 +201,7 @@ where
             raw
         );
 
-        let mut wire = BytesMut::new();
+        let mut wire = BytesMut::with_capacity(raw.len() + 9);
         crate::codec::encode_multipart(&[raw], &mut wire);
         let wire = wire.freeze();
 
@@ -210,8 +210,7 @@ where
                 io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
             })?;
 
-        let data = wire.to_vec();
-        let BufResult(result, _) = stream.write_all(data).await;
+        let BufResult(result, _) = stream.write_all(wire).await;
         result?;
 
         trace!("[XSUB] Subscription event sent successfully");
@@ -383,9 +382,12 @@ impl XSubSocket<TcpStream> {
 
     /// Try to reconnect to the stored endpoint, re-sending all active subscriptions.
     pub async fn try_reconnect(&mut self) -> io::Result<()> {
-        self.base.try_reconnect(crate::session::SocketType::Xsub).await?;
+        self.base
+            .try_reconnect(crate::session::SocketType::Xsub)
+            .await?;
         // Re-send all subscriptions to the fresh connection
-        let prefixes: Vec<bytes::Bytes> = self.subscriptions
+        let prefixes: Vec<bytes::Bytes> = self
+            .subscriptions
             .subscriptions()
             .iter()
             .map(|s| s.prefix.clone())
