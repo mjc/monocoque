@@ -56,6 +56,7 @@ const CURVE_HELLO: &[u8] = b"\x05HELLO";
 const CURVE_WELCOME: &[u8] = b"\x07WELCOME";
 const CURVE_INITIATE: &[u8] = b"\x08INITIATE";
 const CURVE_READY: &[u8] = b"\x05READY";
+const CURVE_READY_PROOF: &[u8] = b"\x01";
 const CURVE_MESSAGE: &[u8] = b"\x07MESSAGE";
 const CURVE_MESSAGE_NONCE_SIZE: usize = 8;
 
