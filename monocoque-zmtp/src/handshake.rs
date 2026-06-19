@@ -20,7 +20,7 @@
 
 use crate::codec::ZmtpError;
 use crate::session::SocketType;
-use crate::utils::{build_ready, encode_frame, FLAG_COMMAND};
+use crate::utils::{FLAG_COMMAND, build_ready, encode_frame};
 use bytes::{Bytes, BytesMut};
 use compio::buf::BufResult;
 use compio::io::{AsyncRead, AsyncWrite};
@@ -103,7 +103,10 @@ where
             ZmtpError::Protocol
         })?;
     write_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 1: Failed to write ZMTP greeting bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 1: Failed to write ZMTP greeting bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -121,7 +124,10 @@ where
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 2: Failed to read ZMTP greeting bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 2: Failed to read ZMTP greeting bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!("[HANDSHAKE] Step 2 DONE: Received peer greeting (64 bytes)");
@@ -131,6 +137,31 @@ where
         warn!(
             "[HANDSHAKE] ZMTP greeting: expected signature byte 0xff at offset 0, got 0x{:02x}",
             greeting_buf[0]
+        );
+        return Err(ZmtpError::Protocol);
+    }
+    if greeting_buf[9] != 0x7F {
+        warn!(
+            "[HANDSHAKE] ZMTP greeting: expected signature byte 0x7f at offset 9, got 0x{:02x}",
+            greeting_buf[9]
+        );
+        return Err(ZmtpError::Protocol);
+    }
+
+    let peer_major = greeting_buf[10];
+    if mechanism != SecurityMechanism::Null && peer_major != 3 {
+        warn!(
+            "[HANDSHAKE] non-NULL mechanism {:?} cannot negotiate with ZMTP major version {}",
+            mechanism, peer_major
+        );
+        return Err(ZmtpError::Protocol);
+    }
+
+    let peer_mechanism = parse_greeting_mechanism(&greeting_buf[12..32])?;
+    if peer_mechanism != mechanism {
+        warn!(
+            "[HANDSHAKE] security mechanism mismatch: local {:?}, peer {:?}",
+            mechanism, peer_mechanism
         );
         return Err(ZmtpError::Protocol);
     }
@@ -155,11 +186,17 @@ where
     let BufResult(write_res, _) = write_all_with_timeout(stream, ready_frame.clone(), timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 4: Failed to send ZMTP READY command: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 4: Failed to send ZMTP READY command: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
     write_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 4: Failed to write ZMTP READY command bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 4: Failed to write ZMTP READY command bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -173,11 +210,17 @@ where
     let BufResult(read_res, header_buf) = read_exact_with_timeout(stream, header_buf, timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY frame header: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to receive ZMTP READY frame header: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY frame header bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 5: Failed to read ZMTP READY frame header bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -204,11 +247,17 @@ where
         let BufResult(read_res, len_buf) = read_exact_with_timeout(stream, len_buf, timeout)
             .await
             .map_err(|e| {
-                warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY long-frame length: {}", e);
+                warn!(
+                    "[HANDSHAKE] Step 5: Failed to receive ZMTP READY long-frame length: {}",
+                    e
+                );
                 ZmtpError::Protocol
             })?;
         read_res.map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY long-frame length bytes: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to read ZMTP READY long-frame length bytes: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
         u64::from_be_bytes(len_buf) as usize
@@ -230,11 +279,17 @@ where
     let BufResult(read_res, body_buf) = read_exact_with_timeout(stream, body_buf, timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY body ({} bytes): {}", body_len, e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to receive ZMTP READY body ({} bytes): {}",
+                body_len, e
+            );
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY body bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 5: Failed to read ZMTP READY body bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!("[HANDSHAKE] Step 5c DONE: Read {} bytes of body", body_len);
@@ -271,7 +326,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use crate::security::plain::{
-        plain_client_handshake, plain_server_handshake, PlainCredentials, StaticPlainHandler,
+        PlainCredentials, StaticPlainHandler, plain_client_handshake, plain_server_handshake,
     };
 
     if options.plain_server {
@@ -385,6 +440,19 @@ fn build_greeting_with_mechanism(mechanism: SecurityMechanism, options: &SocketO
     b.freeze()
 }
 
+fn parse_greeting_mechanism(field: &[u8]) -> Result<SecurityMechanism, ZmtpError> {
+    let len = field
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(field.len());
+    match &field[..len] {
+        b"NULL" => Ok(SecurityMechanism::Null),
+        b"PLAIN" => Ok(SecurityMechanism::Plain),
+        b"CURVE" => Ok(SecurityMechanism::Curve),
+        _ => Err(ZmtpError::Protocol),
+    }
+}
+
 /// Parse READY command to extract socket type and identity
 fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), ZmtpError> {
     // READY format:
@@ -427,14 +495,14 @@ fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), Zmtp
         offset += 1;
 
         if offset + key_len > body.len() {
-            break;
+            return Err(ZmtpError::Protocol);
         }
 
         let key = &body[offset..offset + key_len];
         offset += key_len;
 
         if offset + 4 > body.len() {
-            break;
+            return Err(ZmtpError::Protocol);
         }
 
         let value_len = u32::from_be_bytes([
@@ -446,7 +514,7 @@ fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), Zmtp
         offset += 4;
 
         if offset + value_len > body.len() {
-            break;
+            return Err(ZmtpError::Protocol);
         }
 
         // Store the range for zero-copy slice
@@ -473,6 +541,202 @@ fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), Zmtp
         ZmtpError::Protocol
     })?;
     Ok((socket_type, identity))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+    use compio::buf::BufResult;
+    use compio::net::{TcpListener, TcpStream};
+    use compio::runtime;
+    use monocoque_core::options::SocketOptions;
+    use monocoque_core::timeout::{read_exact_with_timeout, write_all_with_timeout};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+    async fn read_client_greeting(stream: &mut TcpStream) {
+        let greeting = [0u8; 64];
+        let BufResult(read_res, _) = read_exact_with_timeout(stream, greeting, Some(TEST_TIMEOUT))
+            .await
+            .unwrap();
+        read_res.unwrap();
+    }
+
+    async fn write_greeting(stream: &mut TcpStream, greeting: Vec<u8>) {
+        let BufResult(write_res, _) = write_all_with_timeout(stream, greeting, Some(TEST_TIMEOUT))
+            .await
+            .unwrap();
+        write_res.unwrap();
+    }
+
+    async fn maybe_read_plain_hello(stream: &mut TcpStream) -> Option<[u8; 6]> {
+        let header = [0u8; 6];
+        let Ok(BufResult(read_res, header)) =
+            read_exact_with_timeout(stream, header, Some(TEST_TIMEOUT)).await
+        else {
+            return None;
+        };
+        read_res.ok()?;
+        Some(header)
+    }
+
+    async fn maybe_complete_ready_exchange(stream: &mut TcpStream) {
+        let header = [0u8; 2];
+        let Ok(BufResult(read_res, header)) =
+            read_exact_with_timeout(stream, header, Some(TEST_TIMEOUT)).await
+        else {
+            return;
+        };
+        if read_res.is_err() {
+            return;
+        }
+
+        let body = vec![0u8; header[1] as usize];
+        let Ok(BufResult(read_res, _)) =
+            read_exact_with_timeout(stream, body, Some(TEST_TIMEOUT)).await
+        else {
+            return;
+        };
+        if read_res.is_err() {
+            return;
+        }
+
+        let ready_body = crate::utils::build_ready("PAIR", None);
+        let ready_frame = crate::utils::encode_frame(crate::utils::FLAG_COMMAND, &ready_body);
+        let Ok(BufResult(write_res, _)) =
+            write_all_with_timeout(stream, ready_frame.to_vec(), Some(TEST_TIMEOUT)).await
+        else {
+            return;
+        };
+        let _ = write_res;
+    }
+
+    #[test]
+    fn ready_parser_rejects_truncated_property_after_socket_type() {
+        let mut body = BytesMut::from(crate::utils::build_ready("PAIR", None).as_ref());
+        body.extend_from_slice(&[8]);
+        body.extend_from_slice(b"Identity");
+        body.extend_from_slice(&5u32.to_be_bytes());
+        body.extend_from_slice(b"a");
+
+        assert!(
+            parse_ready_command(&body.freeze()).is_err(),
+            "READY parser accepted a command with truncated trailing identity metadata"
+        );
+    }
+
+    #[compio::test]
+    async fn handshake_rejects_peer_greeting_with_invalid_signature_tail() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_client_greeting(&mut stream).await;
+
+            let mut bad_greeting =
+                build_greeting_with_mechanism(SecurityMechanism::Null, &SocketOptions::new())
+                    .to_vec();
+            bad_greeting[9] = 0x00;
+            write_greeting(&mut stream, bad_greeting).await;
+            maybe_complete_ready_exchange(&mut stream).await;
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let result = perform_handshake_with_options(
+            &mut stream,
+            SocketType::Req,
+            None,
+            Some(TEST_TIMEOUT),
+            &SocketOptions::new(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "handshake accepted a peer greeting with an invalid ZMTP signature tail"
+        );
+
+        let _ = peer_task.await;
+    }
+
+    #[compio::test]
+    async fn non_null_handshake_rejects_peer_greeting_with_unsupported_major_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            read_client_greeting(&mut stream).await;
+
+            let mut bad_greeting = build_greeting_with_mechanism(
+                SecurityMechanism::Plain,
+                &SocketOptions::new().with_plain_server(true),
+            )
+            .to_vec();
+            bad_greeting[10] = 2;
+            write_greeting(&mut stream, bad_greeting).await;
+
+            assert!(
+                maybe_read_plain_hello(&mut stream).await.as_ref() != Some(b"\x05HELLO"),
+                "PLAIN client sent security commands to a ZMTP 2.x peer"
+            );
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let options = SocketOptions::new().with_plain_credentials("alice", "secret");
+        let result = perform_handshake_with_options(
+            &mut stream,
+            SocketType::Req,
+            None,
+            Some(TEST_TIMEOUT),
+            &options,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "non-NULL handshake accepted an unsupported ZMTP major version during security negotiation"
+        );
+
+        let _ = peer_task.await;
+    }
+
+    #[compio::test]
+    async fn plain_client_does_not_send_credentials_to_peer_advertising_null() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer_task = runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            read_client_greeting(&mut stream).await;
+
+            let peer_greeting =
+                build_greeting_with_mechanism(SecurityMechanism::Null, &SocketOptions::new());
+            write_greeting(&mut stream, peer_greeting.to_vec()).await;
+
+            assert!(
+                maybe_read_plain_hello(&mut stream).await.as_ref() != Some(b"\x05HELLO"),
+                "PLAIN client sent credentials to a peer that advertised NULL security"
+            );
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let options = SocketOptions::new().with_plain_credentials("alice", "secret");
+        let _ = perform_handshake_with_options(
+            &mut stream,
+            SocketType::Req,
+            None,
+            Some(TEST_TIMEOUT),
+            &options,
+        )
+        .await;
+
+        let _ = peer_task.await;
+    }
 }
 
 /// Parse socket type from bytes

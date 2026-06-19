@@ -4,8 +4,8 @@
 /// ZAP handlers run on inproc://zeromq.zap.01 and process authentication
 /// requests from server sockets.
 use crate::security::plain::PlainAuthHandler;
-use crate::security::zap::{ZapMechanism, ZapRequest, ZapResponse};
-use crate::{inproc_stream::InprocStream, DealerSocket};
+use crate::security::zap::{ZAP_VERSION, ZapMechanism, ZapRequest, ZapResponse};
+use crate::{DealerSocket, inproc_stream::InprocStream};
 use monocoque_core::options::SocketOptions;
 use std::io;
 use std::sync::Arc;
@@ -50,6 +50,13 @@ impl<H: PlainAuthHandler> DefaultZapHandler<H> {
 #[async_trait::async_trait(?Send)]
 impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
     async fn authenticate(&self, request: &ZapRequest) -> ZapResponse {
+        if request.version != ZAP_VERSION {
+            return ZapResponse::failure(
+                request.request_id.clone(),
+                "Unsupported ZAP request version",
+            );
+        }
+
         match request.mechanism {
             ZapMechanism::Null => {
                 // NULL mechanism - always accept
@@ -57,12 +64,28 @@ impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
             }
             ZapMechanism::Plain => {
                 // Extract username and password
-                if request.credentials.len() < 2 {
+                if request.credentials.len() != 2 {
                     return ZapResponse::failure(request.request_id.clone(), "Missing credentials");
                 }
 
-                let username = String::from_utf8_lossy(&request.credentials[0]);
-                let password = String::from_utf8_lossy(&request.credentials[1]);
+                let username = match std::str::from_utf8(&request.credentials[0]) {
+                    Ok(username) => username,
+                    Err(_) => {
+                        return ZapResponse::failure(
+                            request.request_id.clone(),
+                            "Invalid UTF-8 username",
+                        );
+                    }
+                };
+                let password = match std::str::from_utf8(&request.credentials[1]) {
+                    Ok(password) => password,
+                    Err(_) => {
+                        return ZapResponse::failure(
+                            request.request_id.clone(),
+                            "Invalid UTF-8 password",
+                        );
+                    }
+                };
 
                 // Call PLAIN handler
                 match self
@@ -76,7 +99,7 @@ impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
             }
             ZapMechanism::Curve => {
                 // CURVE mechanism - verify public key is present
-                if request.credentials.is_empty() {
+                if request.credentials.len() != 1 {
                     return ZapResponse::failure(
                         request.request_id.clone(),
                         "Missing CURVE public key",
@@ -94,6 +117,12 @@ impl<H: PlainAuthHandler> ZapHandler for DefaultZapHandler<H> {
                     return ZapResponse::failure(
                         request.request_id.clone(),
                         "Invalid CURVE key length",
+                    );
+                }
+                if public_key.iter().all(|&byte| byte == 0) {
+                    return ZapResponse::failure(
+                        request.request_id.clone(),
+                        "Invalid CURVE public key",
                     );
                 }
 
@@ -250,25 +279,46 @@ pub fn start_default_zap_server<H: PlainAuthHandler + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::plain::StaticPlainHandler;
     use crate::security::ZapStatus;
+    use crate::security::curve::CurveKeyPair;
+    use crate::security::plain::StaticPlainHandler;
     use bytes::Bytes;
+
+    fn zap_request(mechanism: ZapMechanism, credentials: Vec<Bytes>) -> ZapRequest {
+        ZapRequest {
+            version: "1.0".to_string(),
+            request_id: "request".to_string(),
+            domain: "global".to_string(),
+            address: "127.0.0.1".to_string(),
+            identity: Bytes::new(),
+            mechanism,
+            credentials,
+        }
+    }
+
+    fn plain_request(credentials: Vec<Bytes>) -> ZapRequest {
+        zap_request(ZapMechanism::Plain, credentials)
+    }
+
+    fn curve_request(credentials: Vec<Bytes>) -> ZapRequest {
+        zap_request(ZapMechanism::Curve, credentials)
+    }
+
+    fn default_handler(accept_curve: bool) -> DefaultZapHandler<StaticPlainHandler> {
+        DefaultZapHandler::new(Arc::new(StaticPlainHandler::new()), accept_curve)
+    }
+
+    fn default_plain_handler() -> DefaultZapHandler<StaticPlainHandler> {
+        let mut plain_handler = StaticPlainHandler::new();
+        plain_handler.add_user("admin", "secret");
+        DefaultZapHandler::new(Arc::new(plain_handler), true)
+    }
 
     #[test]
     fn test_default_zap_handler_null() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, true);
-
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "1".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Null,
-                credentials: vec![],
-            };
+            let handler = default_handler(true);
+            let request = zap_request(ZapMechanism::Null, vec![]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Success);
@@ -278,19 +328,8 @@ mod tests {
     #[test]
     fn test_default_zap_handler_plain_success() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut plain_handler = StaticPlainHandler::new();
-            plain_handler.add_user("admin", "secret");
-            let handler = DefaultZapHandler::new(Arc::new(plain_handler), true);
-
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "2".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Plain,
-                credentials: vec![Bytes::from("admin"), Bytes::from("secret")],
-            };
+            let handler = default_plain_handler();
+            let request = plain_request(vec![Bytes::from("admin"), Bytes::from("secret")]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Success);
@@ -299,20 +338,60 @@ mod tests {
     }
 
     #[test]
+    fn default_zap_handler_rejects_plain_request_with_extra_credentials() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_plain_handler();
+            let request = plain_request(vec![
+                Bytes::from("admin"),
+                Bytes::from("secret"),
+                Bytes::from("ignored-injected-frame"),
+            ]);
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler authenticated a malformed PLAIN request with extra credential frames"
+            );
+        });
+    }
+
+    #[test]
+    fn default_zap_handler_rejects_unsupported_request_version() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_plain_handler();
+            let mut request = plain_request(vec![Bytes::from("admin"), Bytes::from("secret")]);
+            request.version = "0.9".to_string();
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler accepted credentials from an unsupported ZAP request version"
+            );
+        });
+    }
+
+    #[test]
+    fn default_zap_handler_rejects_invalid_utf8_plain_credentials() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_plain_handler();
+            let request = plain_request(vec![Bytes::from(vec![0xff]), Bytes::from("secret")]);
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler authenticated invalid UTF-8 PLAIN credentials after lossy conversion"
+            );
+        });
+    }
+
+    #[test]
     fn test_default_zap_handler_plain_failure() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, true);
-
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "3".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Plain,
-                credentials: vec![Bytes::from("admin"), Bytes::from("wrong")],
-            };
+            let handler = default_handler(true);
+            let request = plain_request(vec![Bytes::from("admin"), Bytes::from("wrong")]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Failure);
@@ -322,19 +401,10 @@ mod tests {
     #[test]
     fn test_default_zap_handler_curve_success() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, true);
+            let handler = default_handler(true);
 
-            let public_key = [0u8; 32];
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "4".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Curve,
-                credentials: vec![Bytes::copy_from_slice(&public_key)],
-            };
+            let public_key = CurveKeyPair::generate().public;
+            let request = curve_request(vec![Bytes::copy_from_slice(public_key.as_bytes())]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Success);
@@ -342,21 +412,47 @@ mod tests {
     }
 
     #[test]
+    fn default_zap_handler_rejects_curve_request_with_extra_credentials() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_handler(true);
+
+            let public_key = CurveKeyPair::generate().public;
+            let request = curve_request(vec![
+                Bytes::copy_from_slice(public_key.as_bytes()),
+                Bytes::from("ignored-injected-frame"),
+            ]);
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler authenticated a malformed CURVE request with extra credential frames"
+            );
+        });
+    }
+
+    #[test]
+    fn default_zap_handler_rejects_all_zero_curve_public_key() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let handler = default_handler(true);
+            let request = curve_request(vec![Bytes::copy_from_slice(&[0u8; 32])]);
+
+            let response = handler.authenticate(&request).await;
+            assert_eq!(
+                response.status_code,
+                ZapStatus::Failure,
+                "Default ZAP handler accepted an all-zero CURVE public key"
+            );
+        });
+    }
+
+    #[test]
     fn test_default_zap_handler_curve_disabled() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let plain_handler = Arc::new(StaticPlainHandler::new());
-            let handler = DefaultZapHandler::new(plain_handler, false);
+            let handler = default_handler(false);
 
             let public_key = [0u8; 32];
-            let request = ZapRequest {
-                version: "1.0".to_string(),
-                request_id: "5".to_string(),
-                domain: "global".to_string(),
-                address: "127.0.0.1".to_string(),
-                identity: Bytes::new(),
-                mechanism: ZapMechanism::Curve,
-                credentials: vec![Bytes::copy_from_slice(&public_key)],
-            };
+            let request = curve_request(vec![Bytes::copy_from_slice(&public_key)]);
 
             let response = handler.authenticate(&request).await;
             assert_eq!(response.status_code, ZapStatus::Failure);
@@ -381,7 +477,11 @@ mod tests {
     impl ZapHandler for IpDenyListHandler {
         async fn authenticate(&self, request: &ZapRequest) -> ZapResponse {
             // Reject if the peer address starts with any denied IP prefix
-            if self.denied_ips.iter().any(|ip| request.address.starts_with(ip.as_str())) {
+            if self
+                .denied_ips
+                .iter()
+                .any(|ip| request.address.starts_with(ip.as_str()))
+            {
                 return ZapResponse::failure(
                     request.request_id.clone(),
                     format!("Address {} is blocked", request.address),
