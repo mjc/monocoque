@@ -39,6 +39,7 @@
 use bytes::Bytes;
 use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
 use flume::{Receiver, Sender};
+use monocoque_core::alloc::IoArena;
 use monocoque_core::subscription::SubscriptionEvent;
 
 use crate::handshake::perform_handshake_with_options;
@@ -117,17 +118,17 @@ async fn subscription_reader(
 ) {
     use compio::buf::BufResult;
     use compio::io::AsyncRead;
-    use monocoque_core::buffer::SegmentedBuffer;
 
     trace!("[PUB] Subscription reader started for subscriber {}", id);
 
-    let mut recv_buf = SegmentedBuffer::new();
+    let mut arena = IoArena::new();
+    let mut recv_buf = monocoque_core::buffer::SegmentedBuffer::new();
     let mut decoder = crate::codec::ZmtpDecoder::new();
 
     loop {
         // Read a chunk from the subscriber.
-        let buf = vec![0u8; 256];
-        let BufResult(result, buf) = reader.read(buf).await;
+        let slab = arena.alloc_mut(256);
+        let BufResult(result, slab) = reader.read(slab).await;
 
         match result {
             Ok(0) => {
@@ -135,22 +136,22 @@ async fn subscription_reader(
                 break;
             }
             Ok(n) => {
-                recv_buf.push(Bytes::from(buf[..n].to_vec()));
+                debug_assert!(n <= 256);
+                recv_buf.push(slab.freeze());
 
                 // Drain all complete ZMTP frames from the accumulated buffer.
                 loop {
                     match decoder.decode(&mut recv_buf) {
                         Ok(Some(frame)) => {
-                            if let Some(event) =
-                                SubscriptionEvent::from_message(&frame.payload)
-                            {
+                            if let Some(event) = SubscriptionEvent::from_bytes(frame.payload) {
                                 let mut subs = subscriptions.write();
                                 match event {
                                     SubscriptionEvent::Subscribe(prefix) => {
                                         if !subs.contains(&prefix) {
                                             trace!(
                                                 "[PUB] Subscriber {} subscribed to {:?}",
-                                                id, prefix
+                                                id,
+                                                prefix
                                             );
                                             subs.push(prefix);
                                         }
@@ -158,7 +159,8 @@ async fn subscription_reader(
                                     SubscriptionEvent::Unsubscribe(prefix) => {
                                         trace!(
                                             "[PUB] Subscriber {} unsubscribed from {:?}",
-                                            id, prefix
+                                            id,
+                                            prefix
                                         );
                                         subs.retain(|s| s != &prefix);
                                     }
@@ -238,7 +240,11 @@ fn worker_thread(worker_id: usize, rx: Receiver<WorkerCommand>) {
                     );
 
                     // Encode once, broadcast N times via O(1) Bytes::clone()
-                    let mut wire_buf = bytes::BytesMut::new();
+                    let wire_capacity: usize = message
+                        .iter()
+                        .map(|part| part.len() + if part.len() >= 256 { 9 } else { 2 })
+                        .sum();
+                    let mut wire_buf = bytes::BytesMut::with_capacity(wire_capacity);
                     crate::codec::encode_multipart(&message, &mut wire_buf);
                     let wire = wire_buf.freeze();
 

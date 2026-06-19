@@ -23,6 +23,7 @@
 
 use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
+use monocoque_core::alloc::IoArena;
 use monocoque_core::options::SocketOptions;
 use monocoque_core::subscription::{SubscriptionEvent, SubscriptionTrie};
 use smallvec::SmallVec;
@@ -235,6 +236,7 @@ impl XPubSocket {
         use compio::io::AsyncRead;
         use compio::time::timeout;
         use std::time::Duration;
+        let mut arena = IoArena::new();
 
         // Return pending events first
         if !self.pending_events.is_empty() {
@@ -250,15 +252,16 @@ impl XPubSocket {
             self.subscribers.len()
         );
         for sub in self.subscribers.values_mut() {
-            let buf = vec![0u8; 256];
+            let slab = arena.alloc_mut(256);
 
             // Use a short timeout to avoid blocking
-            let read_result = timeout(Duration::from_millis(1), sub.stream.read(buf)).await;
+            let read_result = timeout(Duration::from_millis(1), sub.stream.read(slab)).await;
 
             match read_result {
-                Ok(BufResult(Ok(n), buf)) if n > 0 => {
+                Ok(BufResult(Ok(n), slab)) if n > 0 => {
                     trace!("[XPUB] Received {} bytes from subscriber {}", n, sub.id);
-                    sub.recv_buf.push(bytes::Bytes::from(buf[..n].to_vec()));
+                    debug_assert!(n <= 256);
+                    sub.recv_buf.push(slab.freeze());
 
                     // Drain all complete ZMTP frames from the buffer
                     loop {
@@ -274,7 +277,7 @@ impl XPubSocket {
                                     }
                                     continue;
                                 }
-                                if let Some(event) = SubscriptionEvent::from_message(&frame.payload) {
+                                if let Some(event) = SubscriptionEvent::from_bytes(frame.payload) {
                                     trace!(
                                         "[XPUB] Subscription event from subscriber {}: {:?}",
                                         sub.id,
@@ -346,7 +349,11 @@ impl XPubSocket {
         trace!("[XPUB] Broadcasting message with {} frames", msg.len());
 
         // Encode once, broadcast via O(1) Bytes::clone() per subscriber.
-        let mut wire_buf = BytesMut::new();
+        let wire_capacity: usize = msg
+            .iter()
+            .map(|part| part.len() + if part.len() >= 256 { 9 } else { 2 })
+            .sum();
+        let mut wire_buf = BytesMut::with_capacity(wire_capacity);
         crate::codec::encode_multipart(&msg, &mut wire_buf);
         let wire = wire_buf.freeze();
 
