@@ -160,7 +160,8 @@ where
                             trace!("[ROUTER] Received {} frames", msg.len());
 
                             // Prepend peer identity to the message
-                            let mut frames = vec![self.peer_identity.clone()];
+                            let mut frames = Vec::with_capacity(msg.len() + 1);
+                            frames.push(self.peer_identity.clone());
                             frames.extend(msg);
 
                             return Ok(Some(frames));
