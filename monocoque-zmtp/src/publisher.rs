@@ -45,6 +45,7 @@ use crate::handshake::perform_handshake_with_options;
 use crate::session::SocketType;
 use monocoque_core::options::SocketOptions;
 use monocoque_core::poison::PoisonGuard;
+use monocoque_core::subscription::topic_matches_prefixes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
@@ -66,6 +67,7 @@ enum WorkerCommand {
         id: SubscriberId,
         stream: TcpStream,
         subscriptions: SubscriptionState,
+        max_body_len: Option<usize>,
     },
     /// Broadcast a message to all subscribers in this worker
     Broadcast { message: Arc<Vec<Bytes>> },
@@ -85,22 +87,9 @@ impl WorkerSubscriber {
     fn matches(&self, msg: &[Bytes]) -> bool {
         let subs = self.subscriptions.read();
 
-        // Empty subscriptions = subscribe to all
-        if subs.is_empty() {
-            return true;
-        }
-
         // Check first frame against subscription prefixes
-        if let Some(first_frame) = msg.first() {
-            for sub in subs.iter() {
-                if sub.is_empty()
-                    || (first_frame.len() >= sub.len() && first_frame[..sub.len()] == sub[..])
-                {
-                    return true;
-                }
-            }
-        }
-        false
+        msg.first()
+            .is_some_and(|first_frame| topic_matches_prefixes(first_frame, &subs))
     }
 }
 
@@ -114,6 +103,7 @@ async fn subscription_reader(
     id: SubscriberId,
     mut reader: OwnedReadHalf<TcpStream>,
     subscriptions: SubscriptionState,
+    max_body_len: Option<usize>,
 ) {
     use compio::buf::BufResult;
     use compio::io::AsyncRead;
@@ -122,7 +112,7 @@ async fn subscription_reader(
     trace!("[PUB] Subscription reader started for subscriber {}", id);
 
     let mut recv_buf = SegmentedBuffer::new();
-    let mut decoder = crate::codec::ZmtpDecoder::new();
+    let mut decoder = crate::codec::ZmtpDecoder::with_max_body_len(max_body_len);
 
     loop {
         // Read a chunk from the subscriber.
@@ -210,6 +200,7 @@ fn worker_thread(worker_id: usize, rx: Receiver<WorkerCommand>) {
                     id,
                     stream,
                     subscriptions,
+                    max_body_len,
                 }) => {
                     debug!("[Worker {}] Adding subscriber {}", worker_id, id);
 
@@ -219,7 +210,13 @@ fn worker_thread(worker_id: usize, rx: Receiver<WorkerCommand>) {
                     // Spawn background task to read subscription messages.
                     // Runs concurrently within this worker's compio runtime.
                     let sub_state = Arc::clone(&subscriptions);
-                    compio::runtime::spawn(subscription_reader(id, read_half, sub_state)).detach();
+                    compio::runtime::spawn(subscription_reader(
+                        id,
+                        read_half,
+                        sub_state,
+                        max_body_len,
+                    ))
+                    .detach();
 
                     subscribers.insert(
                         id,
@@ -419,6 +416,7 @@ impl PubSocket {
                 id,
                 stream,
                 subscriptions,
+                max_body_len: self.options.max_msg_size,
             })
             .await
             .map_err(|e| io::Error::other(format!("Failed to send to worker: {}", e)))?;

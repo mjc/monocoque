@@ -71,6 +71,7 @@ pub struct ZmtpDecoder {
     pending_flags: Option<u8>,
     expected_body_len: usize,
     staging: BytesMut,
+    max_body_len: Option<usize>,
 }
 
 impl Default for ZmtpDecoder {
@@ -82,10 +83,16 @@ impl Default for ZmtpDecoder {
 impl ZmtpDecoder {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_body_len(None)
+    }
+
+    #[must_use]
+    pub fn with_max_body_len(max_body_len: Option<usize>) -> Self {
         Self {
             pending_flags: None,
             expected_body_len: 0,
             staging: BytesMut::with_capacity(STAGING_BUF_INITIAL_CAP),
+            max_body_len,
         }
     }
 
@@ -112,6 +119,15 @@ impl ZmtpDecoder {
     pub fn decode(&mut self, src: &mut SegmentedBuffer) -> Result<Option<ZmtpFrame>> {
         // === Reassembly mode ===
         if let Some(flags) = self.pending_flags {
+            if let Some(limit) = self.max_body_len {
+                if self.expected_body_len > limit {
+                    self.pending_flags = None;
+                    self.expected_body_len = 0;
+                    self.staging.clear();
+                    return Err(ZmtpError::SizeTooLarge);
+                }
+            }
+
             let needed = self.expected_body_len - self.staging.len();
             let take = needed.min(src.len());
             if let Some(bytes) = src.take_bytes(take) {
@@ -172,6 +188,12 @@ impl ZmtpDecoder {
         };
 
         let total_len = header_len + body_len;
+
+        if let Some(limit) = self.max_body_len {
+            if body_len > limit {
+                return Err(ZmtpError::SizeTooLarge);
+            }
+        }
 
         // === Fast path: entire frame present ===
         if src.len() >= total_len {
@@ -295,5 +317,27 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
         }
 
         buf.extend_from_slice(part);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_rejects_fragmented_frame_larger_than_max_body_len() {
+        let payload = Bytes::from(vec![0x41; 32]);
+        let frame = ZmtpFrame::data(payload, false).encode();
+
+        let mut src = SegmentedBuffer::new();
+        src.push(Bytes::copy_from_slice(&frame[..2]));
+
+        let mut decoder = ZmtpDecoder::with_max_body_len(Some(16));
+        let err = decoder
+            .decode(&mut src)
+            .expect_err("oversized fragmented frame should be rejected before reassembly");
+
+        assert!(matches!(err, ZmtpError::SizeTooLarge));
+        assert_eq!(src.len(), 2, "header bytes should remain buffered");
     }
 }

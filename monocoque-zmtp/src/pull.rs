@@ -105,6 +105,7 @@ where
                             }
                             continue;
                         }
+                        self.base.reject_oversized_frame(frame.payload.len())?;
                         let more = frame.more();
                         self.frames.push(frame.payload);
 

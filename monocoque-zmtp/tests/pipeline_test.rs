@@ -8,6 +8,7 @@
 use bytes::Bytes;
 use monocoque_zmtp::pull::PullSocket;
 use monocoque_zmtp::push::PushSocket;
+use monocoque_core::options::SocketOptions;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -183,4 +184,49 @@ fn test_pull_bind_push_connect() {
 
     let msg = msg_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(msg, vec![Bytes::from("reversed topology")]);
+}
+
+/// A PULL socket with a configured max_msg_size must reject oversized frames.
+#[test]
+fn test_pull_rejects_message_larger_than_configured_max_msg_size() {
+    let (addr_tx, addr_rx) = mpsc::channel::<std::net::SocketAddr>();
+
+    let server_task = thread::spawn(move || {
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+
+                let (stream, _) = listener.accept().await.unwrap();
+                let options = SocketOptions::new().with_max_msg_size(Some(1));
+                let mut pull = PullSocket::with_options(stream, options).await.unwrap();
+
+                pull.recv().await
+            })
+    });
+
+    let addr = addr_rx.recv().unwrap();
+
+    let client = thread::spawn(move || {
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let stream = compio::net::TcpStream::connect(addr).await.unwrap();
+                let mut push = PushSocket::from_tcp(stream).await.unwrap();
+                push.send(vec![Bytes::from("oversized message")])
+                    .await
+                    .unwrap();
+            })
+    });
+
+    client.join().expect("client thread panicked");
+
+    let recv_result = server_task.join().expect("server thread panicked");
+    let err = recv_result.expect_err("receiver accepted an oversized frame");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidData,
+        "oversized frames must be rejected before delivery"
+    );
 }

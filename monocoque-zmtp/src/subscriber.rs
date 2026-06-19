@@ -19,6 +19,7 @@ use tracing::{debug, trace};
 
 use crate::{handshake::perform_handshake_with_options, session::SocketType};
 use monocoque_core::endpoint::Endpoint;
+use monocoque_core::subscription::topic_matches_prefixes;
 
 /// Direct-stream SUB socket.
 pub struct SubSocket<S = TcpStream>
@@ -179,9 +180,10 @@ where
                                     self.base.note_pong_received();
                                 }
                                 continue;
-                            }
-                            let more = frame.more();
-                            self.frames.push(frame.payload);
+                        }
+                        self.base.reject_oversized_frame(frame.payload.len())?;
+                        let more = frame.more();
+                        self.frames.push(frame.payload);
 
                             if !more {
                                 // Complete message received
@@ -189,15 +191,9 @@ where
                                 trace!("[SUB] Received {} frames", msg.len());
 
                                 // Check if message matches any subscription
-                                let matches = {
-                                    let subscriptions = &self.subscriptions;
-                                    msg.first().is_some_and(|first_frame| {
-                                        subscriptions.is_empty()
-                                            || subscriptions
-                                                .iter()
-                                                .any(|sub| first_frame.starts_with(sub))
-                                    })
-                                };
+                                let matches = msg
+                                    .first()
+                                    .is_some_and(|first_frame| topic_matches_prefixes(first_frame, &self.subscriptions));
 
                                 if matches {
                                     return Ok(Some(msg));

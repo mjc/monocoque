@@ -12,7 +12,7 @@
 //! - **Reconnection support**: Optional endpoint storage and backoff logic
 
 use bytes::{BufMut, Bytes, BytesMut};
-use compio::io::{AsyncRead, AsyncWrite};
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
 use monocoque_core::alloc::IoArena;
 use monocoque_core::buffer::SegmentedBuffer;
@@ -182,11 +182,12 @@ where
     /// Buffer sizes are taken from `options.read_buffer_size` and `options.write_buffer_size`.
     pub fn new(stream: S, _socket_type: SocketType, options: SocketOptions) -> Self {
         let write_capacity = options.write_buffer_size;
+        let max_body_len = options.max_msg_size;
         Self {
             stream: Some(stream),
             endpoint: None,
             reconnect: None,
-            decoder: ZmtpDecoder::new(),
+            decoder: ZmtpDecoder::with_max_body_len(max_body_len),
             arena: IoArena::new(),
             recv: SegmentedBuffer::new(),
             write_buf: BytesMut::with_capacity(write_capacity),
@@ -216,11 +217,12 @@ where
     ) -> Self {
         let endpoint_str = endpoint.to_string();
         let write_capacity = options.write_buffer_size;
+        let max_body_len = options.max_msg_size;
         Self {
             stream: Some(stream),
             endpoint: Some(endpoint),
             reconnect: Some(ReconnectState::new(&options)),
-            decoder: ZmtpDecoder::new(),
+            decoder: ZmtpDecoder::with_max_body_len(max_body_len),
             arena: IoArena::new(),
             recv: SegmentedBuffer::new(),
             write_buf: BytesMut::with_capacity(write_capacity),
@@ -258,6 +260,21 @@ where
     #[inline]
     pub fn buffered_bytes(&self) -> usize {
         self.send_buffer.len()
+    }
+
+    /// Reject an incoming frame that exceeds the configured maximum size.
+    #[inline]
+    pub fn reject_oversized_frame(&self, frame_len: usize) -> io::Result<()> {
+        if let Some(max_msg_size) = self.options.max_msg_size {
+            if frame_len > max_msg_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "received message frame exceeds max_msg_size",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if send HWM has been reached.
@@ -547,7 +564,7 @@ where
 
         // Apply send timeout
         let BufResult(result, _) = match self.options.send_timeout {
-            None => AsyncWrite::write(stream, buf).await,
+            None => stream.write_all(buf).await,
             Some(dur) if dur.is_zero() => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -556,7 +573,7 @@ where
             }
             Some(dur) => {
                 use compio::time::timeout;
-                match timeout(dur, AsyncWrite::write(stream, buf)).await {
+                match timeout(dur, stream.write_all(buf)).await {
                     Ok(result) => result,
                     Err(_) => {
                         return Err(io::Error::new(
@@ -617,7 +634,7 @@ where
         let BufResult(result, _) = match self.options.send_timeout {
             None => {
                 // Blocking mode - no timeout
-                AsyncWrite::write(stream, buf).await
+                stream.write_all(buf).await
             }
             Some(dur) if dur.is_zero() => {
                 // Non-blocking mode
@@ -629,7 +646,7 @@ where
             Some(dur) => {
                 // Timed mode - apply timeout
                 use compio::time::timeout;
-                match timeout(dur, AsyncWrite::write(stream, buf)).await {
+                match timeout(dur, stream.write_all(buf)).await {
                     Ok(result) => result,
                     Err(_) => {
                         return Err(io::Error::new(
@@ -758,6 +775,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compio::buf::BufResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    struct ShortWriteStream {
+        written: Arc<Mutex<Vec<u8>>>,
+        write_calls: Arc<AtomicUsize>,
+        max_chunk: usize,
+    }
+
+    impl ShortWriteStream {
+        fn new(max_chunk: usize) -> Self {
+            Self {
+                written: Arc::new(Mutex::new(Vec::new())),
+                write_calls: Arc::new(AtomicUsize::new(0)),
+                max_chunk,
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.written.lock().unwrap().clone()
+        }
+
+        fn write_calls(&self) -> usize {
+            self.write_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl compio::io::AsyncRead for ShortWriteStream {
+        async fn read<B: compio::buf::IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+            BufResult(Ok(0), buf)
+        }
+    }
+
+    impl compio::io::AsyncWrite for ShortWriteStream {
+        async fn write<B: compio::buf::IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            let len = buf.buf_len();
+            let n = len.min(self.max_chunk);
+            self.written
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf.as_slice()[..n]);
+            BufResult(Ok(n), buf)
+        }
+
+        async fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     // ── PING / PONG frame builders ────────────────────────────────────────────
 
@@ -835,5 +907,29 @@ mod tests {
         let frame_max = build_ping_frame(u16::MAX);
         let ttl_max = u16::from_be_bytes([frame_max[7], frame_max[8]]);
         assert_eq!(ttl_max, u16::MAX);
+    }
+
+    #[test]
+    fn test_write_from_buf_completes_short_writes() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let stream = ShortWriteStream::new(4);
+            let captured = stream.clone();
+            let mut base = SocketBase::new(
+                stream,
+                SocketType::Pair,
+                monocoque_core::options::SocketOptions::default(),
+            );
+
+            base.write_buf.extend_from_slice(b"security frame");
+            base.write_from_buf().await.unwrap();
+
+            assert_eq!(captured.bytes(), b"security frame");
+            assert!(
+                captured.write_calls() > 1,
+                "short writes must be retried until the whole frame is sent"
+            );
+        });
     }
 }

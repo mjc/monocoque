@@ -189,7 +189,9 @@ impl XPubSocket {
                         stream,
                         subscriptions: SubscriptionTrie::new(),
                         recv_buf: monocoque_core::buffer::SegmentedBuffer::new(),
-                        decoder: crate::codec::ZmtpDecoder::new(),
+                        decoder: crate::codec::ZmtpDecoder::with_max_body_len(
+                            self.options.max_msg_size,
+                        ),
                     },
                 );
 
@@ -273,6 +275,14 @@ impl XPubSocket {
                                         let _ = result; // best-effort; disconnect handled elsewhere
                                     }
                                     continue;
+                                }
+                                if let Some(max_msg_size) = self.options.max_msg_size {
+                                    if frame.payload.len() > max_msg_size {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "received message frame exceeds max_msg_size",
+                                        ));
+                                    }
                                 }
                                 if let Some(event) = SubscriptionEvent::from_message(&frame.payload) {
                                     trace!(

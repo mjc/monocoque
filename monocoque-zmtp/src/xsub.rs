@@ -242,6 +242,7 @@ where
             loop {
                 match self.base.decoder.decode(&mut self.base.recv)? {
                     Some(frame) => {
+                        self.base.reject_oversized_frame(frame.payload.len())?;
                         let more = frame.more();
                         frames.push(frame.payload);
                         if !more {

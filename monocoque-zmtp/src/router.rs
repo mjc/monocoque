@@ -151,6 +151,7 @@ where
                             }
                             continue;
                         }
+                        self.base.reject_oversized_frame(frame.payload.len())?;
                         let more = frame.more();
                         self.frames.push(frame.payload);
 
@@ -214,11 +215,22 @@ where
     /// Use this for batching multiple messages before a single flush.
     /// Call `flush()` to send all buffered messages.
     pub fn send_buffered(&mut self, msg: Vec<Bytes>) -> io::Result<()> {
+        if self.base.buffered_messages >= self.base.options.send_hwm {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Send high water mark reached ({} messages). Flush or drop messages.",
+                    self.base.options.send_hwm
+                ),
+            ));
+        }
+
         trace!("[ROUTER] Buffering {} frames", msg.len());
 
         // Skip the first frame (identity) and encode the rest
         let frames_to_send = if msg.len() > 1 { &msg[1..] } else { &msg[..] };
         encode_multipart(frames_to_send, &mut self.base.send_buffer);
+        self.base.buffered_messages += 1;
         Ok(())
     }
 
@@ -235,8 +247,18 @@ where
         trace!("[ROUTER] Batching {} messages", messages.len());
 
         for msg in messages {
+            if self.base.buffered_messages >= self.base.options.send_hwm {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "Send high water mark reached ({} messages)",
+                        self.base.options.send_hwm
+                    ),
+                ));
+            }
             let frames_to_send = if msg.len() > 1 { &msg[1..] } else { &msg[..] };
             encode_multipart(frames_to_send, &mut self.base.send_buffer);
+            self.base.buffered_messages += 1;
         }
 
         self.flush().await
