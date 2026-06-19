@@ -7,7 +7,6 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use monocoque_core::options::SocketOptions;
-use monocoque_zmtp::{DealerSocket, PairSocket, PubSocket, PullSocket, PushSocket, SubSocket};
 use std::time::Duration;
 
 // Helper to run async code in compio runtime
@@ -143,28 +142,6 @@ fn bench_socket_options(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark DEALER socket creation
-fn bench_dealer_creation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("dealer_creation");
-
-    group.bench_function("new_with_defaults", |b| {
-        b.iter(|| {
-            let socket: DealerSocket = DealerSocket::new();
-            black_box(socket);
-        });
-    });
-
-    group.bench_function("new_with_options", |b| {
-        b.iter(|| {
-            let opts = SocketOptions::new().with_recv_timeout(Duration::from_secs(5));
-            let socket = DealerSocket::with_options(opts);
-            black_box(socket);
-        });
-    });
-
-    group.finish();
-}
-
 /// Benchmark zero-copy operations
 fn bench_zero_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("zero_copy");
@@ -195,7 +172,6 @@ criterion_group!(
     bench_push_pull_pipeline,
     bench_message_construction,
     bench_socket_options,
-    bench_dealer_creation,
     bench_zero_copy
 );
 
