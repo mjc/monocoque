@@ -105,8 +105,10 @@ where
         trace!("[SUB] Adding subscription: {:?}", prefix);
 
         if !self.subscriptions.contains(&prefix) {
-            self.subscriptions.push(prefix.clone());
+            self.send_sub_event(0x01, &prefix).await?;
+            self.subscriptions.push(prefix);
             self.subscriptions.sort();
+            return Ok(());
         }
 
         self.send_sub_event(0x01, &prefix).await
@@ -130,15 +132,9 @@ where
     async fn send_sub_event(&mut self, cmd: u8, prefix: &[u8]) -> io::Result<()> {
         use compio::buf::BufResult;
         use compio::io::AsyncWriteExt;
-        // Build payload: [cmd][prefix]
-        let mut payload = BytesMut::with_capacity(1 + prefix.len());
-        payload.extend_from_slice(&[cmd]);
-        payload.extend_from_slice(prefix);
-        let payload = payload.freeze();
 
-        // ZMTP-frame it (single-frame message)
-        let mut wire = BytesMut::with_capacity(payload.len() + 9);
-        crate::codec::encode_multipart(&[payload], &mut wire);
+        let mut wire = BytesMut::new();
+        crate::codec::encode_subscription_event_frame(cmd, prefix, &mut wire);
         let wire = wire.freeze();
 
         trace!(
@@ -382,10 +378,11 @@ impl SubSocket<TcpStream> {
     /// Try to reconnect to the stored endpoint and re-send all active subscriptions.
     pub async fn try_reconnect(&mut self) -> io::Result<()> {
         self.base.try_reconnect(SocketType::Sub).await?;
-        let subs: Vec<bytes::Bytes> = self.subscriptions.clone();
-        for prefix in subs {
-            self.send_sub_event(0x01, &prefix.clone()).await?;
+        let subs = std::mem::take(&mut self.subscriptions);
+        for prefix in &subs {
+            self.send_sub_event(0x01, prefix).await?;
         }
+        self.subscriptions = subs;
         Ok(())
     }
 
