@@ -21,7 +21,7 @@
 use crate::codec::ZmtpError;
 use crate::security::protocol::parse_ready_command;
 use crate::session::SocketType;
-use crate::utils::{FLAG_COMMAND, build_ready, encode_frame};
+use crate::utils::{build_ready, encode_frame, FLAG_COMMAND};
 use bytes::{Bytes, BytesMut};
 use compio::buf::BufResult;
 use compio::io::{AsyncRead, AsyncWrite};
@@ -327,7 +327,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use crate::security::plain::{
-        PlainCredentials, StaticPlainHandler, plain_client_handshake, plain_server_handshake,
+        plain_client_handshake, plain_server_handshake, PlainCredentials, StaticPlainHandler,
     };
 
     if options.plain_server {

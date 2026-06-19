@@ -13,7 +13,7 @@
 /// "default-deny" security posture: if there is no handler to approve the
 /// connection it must be denied, not silently accepted.
 use crate::security::zap::{ZapMechanism, ZapRequest, ZapResponse, ZapStatus};
-use crate::{DealerSocket, inproc_stream::InprocStream};
+use crate::{inproc_stream::InprocStream, DealerSocket};
 use bytes::Bytes;
 use monocoque_core::options::SocketOptions;
 use std::io;
@@ -210,9 +210,9 @@ impl ZapClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inproc_stream::InprocStream;
     use crate::security::zap::next_request_id;
     use crate::security::zap::ZAP_ENDPOINT;
-    use crate::inproc_stream::InprocStream;
     use monocoque_core::options::SocketOptions;
     use std::time::Duration;
 

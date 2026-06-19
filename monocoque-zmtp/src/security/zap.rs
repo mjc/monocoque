@@ -140,15 +140,6 @@ pub struct ZapRequest {
 
 impl fmt::Debug for ZapRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let credentials = if self.credentials.is_empty() {
-            "[]".to_string()
-        } else {
-            format!(
-                "[<{} credential frame(s) redacted>]",
-                self.credentials.len()
-            )
-        };
-
         f.debug_struct("ZapRequest")
             .field("version", &self.version)
             .field("request_id", &self.request_id)
@@ -156,8 +147,27 @@ impl fmt::Debug for ZapRequest {
             .field("address", &self.address)
             .field("identity", &self.identity)
             .field("mechanism", &self.mechanism)
-            .field("credentials", &credentials)
+            .field(
+                "credentials",
+                &ZapRequestCredentialsDebug {
+                    len: self.credentials.len(),
+                },
+            )
             .finish()
+    }
+}
+
+struct ZapRequestCredentialsDebug {
+    len: usize,
+}
+
+impl fmt::Debug for ZapRequestCredentialsDebug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.len == 0 {
+            f.write_str("[]")
+        } else {
+            write!(f, "[<{} credential frame(s) redacted>]", self.len)
+        }
     }
 }
 
