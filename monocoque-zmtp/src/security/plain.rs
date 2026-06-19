@@ -36,6 +36,7 @@
 //! ```
 
 use crate::codec::ZmtpError;
+use crate::security::protocol::{read_command_prefix, reject_immediately_available_trailing_bytes};
 use crate::security::zap::{ZapMechanism, ZapRequest, ZapStatus};
 use bytes::{Bytes, BytesMut};
 use compio::io::{AsyncRead, AsyncWrite};
@@ -240,16 +241,7 @@ where
         peer_address
     );
 
-    // Read command header (6 bytes: \x05HELLO)
-    let header = vec![0u8; 6];
-    let buf_result = read_exact_with_timeout(stream, header, timeout).await?;
-    let BufResult(result, header) = buf_result;
-    result?;
-
-    if &header[..] != PLAIN_HELLO {
-        warn!("[PLAIN SERVER] Invalid PLAIN command header");
-        return Err(ZmtpError::Protocol);
-    }
+    read_command_prefix(stream, PLAIN_HELLO, timeout).await?;
 
     // Read username length
     let len_buf = vec![0u8; 1];
@@ -278,7 +270,7 @@ where
     let BufResult(result, password_buf) = buf_result;
     result?;
     let password = String::from_utf8(password_buf).map_err(|_| ZmtpError::Protocol)?;
-    reject_immediately_available_trailing_bytes(stream).await?;
+    reject_immediately_available_trailing_bytes(stream, TRAILING_BYTE_CHECK_TIMEOUT).await?;
 
     debug!("[PLAIN SERVER] Received credentials for user: {}", username);
 
@@ -336,16 +328,7 @@ where
         peer_address
     );
 
-    // Read command header (6 bytes: \x05HELLO)
-    let header = vec![0u8; 6];
-    let buf_result = read_exact_with_timeout(stream, header, timeout).await?;
-    let BufResult(result, header) = buf_result;
-    result?;
-
-    if &header[..] != PLAIN_HELLO {
-        warn!("[PLAIN SERVER ZAP] Invalid PLAIN command header");
-        return Err(ZmtpError::Protocol);
-    }
+    read_command_prefix(stream, PLAIN_HELLO, timeout).await?;
 
     // Read username length
     let len_buf = vec![0u8; 1];
@@ -374,7 +357,7 @@ where
     let BufResult(result, password_buf) = buf_result;
     result?;
     let password = String::from_utf8(password_buf).map_err(|_| ZmtpError::Protocol)?;
-    reject_immediately_available_trailing_bytes(stream).await?;
+    reject_immediately_available_trailing_bytes(stream, TRAILING_BYTE_CHECK_TIMEOUT).await?;
 
     debug!(
         "[PLAIN SERVER ZAP] Received credentials for user: {}, sending ZAP request",
@@ -440,21 +423,6 @@ pub fn create_plain_zap_request(
         ZapMechanism::Plain,
         vec![Bytes::from(username.into()), Bytes::from(password.into())],
     )
-}
-
-async fn reject_immediately_available_trailing_bytes<S>(stream: &mut S) -> Result<(), ZmtpError>
-where
-    S: AsyncRead + Unpin,
-{
-    let trailing = vec![0u8; 1];
-    match compio::time::timeout(TRAILING_BYTE_CHECK_TIMEOUT, stream.read(trailing)).await {
-        Ok(compio::buf::BufResult(Ok(0), _)) | Err(_) => Ok(()),
-        Ok(compio::buf::BufResult(Ok(_), _)) => {
-            warn!("[PLAIN SERVER] PLAIN HELLO contained trailing bytes");
-            Err(ZmtpError::Protocol)
-        }
-        Ok(compio::buf::BufResult(Err(_), _)) => Err(ZmtpError::Protocol),
-    }
 }
 
 #[cfg(test)]

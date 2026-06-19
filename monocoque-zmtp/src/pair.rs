@@ -474,7 +474,7 @@ impl PairSocket<InprocStream> {
         debug!("[PAIR] Binding to inproc endpoint: {}", endpoint);
 
         // Bind to inproc endpoint
-        let (tx, rx) = monocoque_core::inproc::bind_inproc(endpoint)?;
+        let (tx, rx) = monocoque_core::inproc::bind_inproc_bidi(endpoint)?;
         let stream = InprocStream::new(tx, rx);
 
         // Parse endpoint for storage
@@ -517,16 +517,8 @@ impl PairSocket<InprocStream> {
         debug!("[PAIR] Connecting to inproc endpoint: {}", endpoint);
 
         // Connect to inproc endpoint
-        let tx = monocoque_core::inproc::connect_inproc(endpoint)?;
-
-        // For inproc, we need to create a receiver channel
-        // The sender sends to the bound endpoint, we receive on our own channel
-        let (_our_tx, our_rx) = flume::unbounded();
-
-        // Register our receiver with the sender
-        // This is a bit tricky - we need bidirectional communication
-        // For now, create a stream with the connection sender and a new receiver
-        let stream = InprocStream::new(tx, our_rx);
+        let (tx, rx) = monocoque_core::inproc::connect_inproc_bidi(endpoint)?;
+        let stream = InprocStream::new(tx, rx);
 
         // Parse endpoint for storage
         let parsed_endpoint = Endpoint::parse(endpoint)

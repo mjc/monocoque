@@ -13,7 +13,7 @@
 /// "default-deny" security posture: if there is no handler to approve the
 /// connection it must be denied, not silently accepted.
 use crate::security::zap::{ZapMechanism, ZapRequest, ZapResponse, ZapStatus};
-use crate::{inproc_stream::InprocStream, DealerSocket};
+use crate::{DealerSocket, inproc_stream::InprocStream};
 use bytes::Bytes;
 use monocoque_core::options::SocketOptions;
 use std::io;
@@ -104,7 +104,7 @@ impl ZapClient {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
                     "ZAP handler disconnected",
-                ))
+                ));
             }
             Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
                 // Endpoint vanished after send  -  deny (default-deny).
@@ -118,17 +118,29 @@ impl ZapClient {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "ZAP request timed out",
-                ))
+                ));
             }
         };
 
-        // Decode the response
-        ZapResponse::decode(&response_frames).map_err(|e| {
+        // Decode the response and verify it matches the request we sent.
+        let response = ZapResponse::decode(&response_frames).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to decode ZAP response: {}", e),
             )
-        })
+        })?;
+
+        if response.request_id != request.request_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ZAP response request ID {:?} did not match request {:?}",
+                    response.request_id, request.request_id
+                ),
+            ));
+        }
+
+        Ok(response)
     }
 
     /// Send a PLAIN authentication request
@@ -199,6 +211,10 @@ impl ZapClient {
 mod tests {
     use super::*;
     use crate::security::zap::next_request_id;
+    use crate::security::zap::ZAP_ENDPOINT;
+    use crate::inproc_stream::InprocStream;
+    use monocoque_core::options::SocketOptions;
+    use std::time::Duration;
 
     // ZAP client tests require a running ZAP server.
     // Integration tests are in tests/zap_integration.rs
@@ -245,20 +261,75 @@ mod tests {
             ZapMechanism::Null,
             vec![],
         );
-        assert_ne!(r1.request_id, r2.request_id, "each request must have a unique ID");
+        assert_ne!(
+            r1.request_id, r2.request_id,
+            "each request must have a unique ID"
+        );
     }
 
     /// Verify the default-deny sentinel response that is returned when the ZAP
     /// endpoint is unreachable (no handler registered).
     #[test]
     fn test_denial_response_is_failure() {
-        let resp = ZapClient::denial_response("42", "No ZAP handler registered  -  connection denied by default");
+        let resp = ZapClient::denial_response(
+            "42",
+            "No ZAP handler registered  -  connection denied by default",
+        );
         assert_eq!(
             resp.status_code,
             ZapStatus::Failure,
             "missing ZAP handler must produce a Failure (400) response"
         );
-        assert!(resp.user_id.is_empty(), "denied response must have empty user_id");
+        assert!(
+            resp.user_id.is_empty(),
+            "denied response must have empty user_id"
+        );
         assert_eq!(resp.request_id, "42");
+    }
+
+    #[test]
+    fn test_authenticate_rejects_mismatched_response_request_id() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut server = crate::DealerSocket::<InprocStream>::bind_inproc(
+                ZAP_ENDPOINT,
+                SocketOptions::default(),
+            )
+            .expect("bind fake ZAP server");
+            let (done_tx, done_rx) = flume::bounded::<()>(1);
+
+            let server_task = compio::runtime::spawn(async move {
+                let request_frames = server.recv().await.expect("server recv").expect("request");
+                let request = ZapRequest::decode(&request_frames).expect("decode zap request");
+                assert_eq!(request.request_id, "request-1");
+
+                let response = ZapResponse::success("wrong-request-id", "zap-user");
+                server.send(response.encode()).await.expect("server send");
+                let _ = done_rx.recv_async().await;
+            });
+
+            let mut client = ZapClient::new(Duration::from_secs(1)).expect("create zap client");
+            let request = ZapRequest::new(
+                "request-1",
+                "domain",
+                "127.0.0.1",
+                Bytes::new(),
+                ZapMechanism::Null,
+                vec![],
+            );
+
+            let result = client.authenticate(&request).await;
+            assert!(
+                result.is_err(),
+                "mismatched ZAP response request IDs must be rejected"
+            );
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "mismatched request IDs should surface as invalid response data"
+            );
+
+            done_tx.send(()).expect("signal server shutdown");
+            server_task.await;
+        });
     }
 }

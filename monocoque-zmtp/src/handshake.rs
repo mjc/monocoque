@@ -19,6 +19,7 @@
 //! After handshake completes, the main data path uses arena allocator for zero-copy IO.
 
 use crate::codec::ZmtpError;
+use crate::security::protocol::parse_ready_command;
 use crate::session::SocketType;
 use crate::utils::{FLAG_COMMAND, build_ready, encode_frame};
 use bytes::{Bytes, BytesMut};
@@ -52,7 +53,7 @@ impl SecurityMechanism {
     ///
     /// Priority: CURVE > PLAIN > NULL.
     pub fn from_options(options: &SocketOptions) -> Self {
-        if options.curve_secretkey.is_some() || options.curve_server {
+        if options.curve_secretkey().is_some() || options.curve_server {
             Self::Curve
         } else if options.plain_server || options.plain_username.is_some() {
             Self::Plain
@@ -344,7 +345,7 @@ where
             .map(|_| ())
     } else if let Some(ref username) = options.plain_username {
         debug!("[HANDSHAKE] Running PLAIN client exchange");
-        let password = options.plain_password.as_deref().unwrap_or("");
+        let password = options.plain_password().unwrap_or("");
         let credentials = PlainCredentials::new(username.clone(), password);
         plain_client_handshake(stream, &credentials, timeout).await
     } else {
@@ -371,7 +372,7 @@ where
 
     if options.curve_server {
         debug!("[HANDSHAKE] Running CURVE server exchange");
-        let secret_bytes = options.curve_secretkey.ok_or_else(|| {
+        let secret_bytes = options.curve_secretkey().copied().ok_or_else(|| {
             warn!("[HANDSHAKE] CURVE server mode requires curve_secretkey to be set, but it is missing");
             ZmtpError::Protocol
         })?;
@@ -382,7 +383,7 @@ where
         let mut curve_server = CurveServer::new(server_keypair);
         curve_server.handshake(stream, timeout).await.map(|_| ())
     } else if let (Some(secret_bytes), Some(server_key_bytes)) =
-        (options.curve_secretkey, options.curve_serverkey)
+        (options.curve_secretkey().copied(), options.curve_serverkey)
     {
         debug!("[HANDSHAKE] Running CURVE client exchange");
         let client_secret = CurveSecretKey::from_bytes(secret_bytes);
@@ -392,7 +393,7 @@ where
 
         let mut curve_client = CurveClient::new(client_keypair, server_public);
         curve_client.handshake(stream, timeout).await
-    } else if options.curve_secretkey.is_some() {
+    } else if options.curve_secretkey().is_some() {
         // curve_secretkey set for a client but curve_serverkey is absent.
         warn!(
             "[HANDSHAKE] CURVE client mode requires both curve_secretkey and curve_serverkey, \
@@ -451,96 +452,6 @@ fn parse_greeting_mechanism(field: &[u8]) -> Result<SecurityMechanism, ZmtpError
         b"CURVE" => Ok(SecurityMechanism::Curve),
         _ => Err(ZmtpError::Protocol),
     }
-}
-
-/// Parse READY command to extract socket type and identity
-fn parse_ready_command(body: &Bytes) -> Result<(SocketType, Option<Bytes>), ZmtpError> {
-    // READY format:
-    // - 1 byte: command name length
-    // - N bytes: "READY"
-    // - Properties as key-value pairs
-
-    if body.len() < 6 {
-        warn!(
-            "[HANDSHAKE] ZMTP READY parse: body too short  -  got {} bytes, need at least 6",
-            body.len()
-        );
-        return Err(ZmtpError::Protocol);
-    }
-
-    let name_len = body[0] as usize;
-    if name_len != 5 || &body[1..6] != b"READY" {
-        warn!(
-            "[HANDSHAKE] ZMTP READY parse: expected command name \"READY\" (length=5), \
-             got length={} name={:?}",
-            name_len,
-            body.get(1..1 + name_len.min(body.len().saturating_sub(1)))
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default()
-        );
-        return Err(ZmtpError::Protocol);
-    }
-
-    // Parse properties
-    let mut offset = 6;
-    let mut socket_type = None;
-    let mut identity = None;
-
-    while offset < body.len() {
-        if offset + 1 > body.len() {
-            break;
-        }
-
-        let key_len = body[offset] as usize;
-        offset += 1;
-
-        if offset + key_len > body.len() {
-            return Err(ZmtpError::Protocol);
-        }
-
-        let key = &body[offset..offset + key_len];
-        offset += key_len;
-
-        if offset + 4 > body.len() {
-            return Err(ZmtpError::Protocol);
-        }
-
-        let value_len = u32::from_be_bytes([
-            body[offset],
-            body[offset + 1],
-            body[offset + 2],
-            body[offset + 3],
-        ]) as usize;
-        offset += 4;
-
-        if offset + value_len > body.len() {
-            return Err(ZmtpError::Protocol);
-        }
-
-        // Store the range for zero-copy slice
-        let value_start = offset;
-        let value_end = offset + value_len;
-        offset += value_len;
-
-        match key {
-            b"Socket-Type" => {
-                socket_type = Some(parse_socket_type(&body[value_start..value_end])?);
-            }
-            b"Identity" => {
-                // Zero-copy: slice the existing Bytes instead of copying
-                identity = Some(body.slice(value_start..value_end));
-            }
-            _ => {
-                // Ignore unknown properties
-            }
-        }
-    }
-
-    let socket_type = socket_type.ok_or_else(|| {
-        warn!("[HANDSHAKE] ZMTP READY parse: peer READY command is missing the required \"Socket-Type\" property");
-        ZmtpError::Protocol
-    })?;
-    Ok((socket_type, identity))
 }
 
 #[cfg(test)]
@@ -736,29 +647,5 @@ mod tests {
         .await;
 
         let _ = peer_task.await;
-    }
-}
-
-/// Parse socket type from bytes
-fn parse_socket_type(value: &[u8]) -> Result<SocketType, ZmtpError> {
-    match value {
-        b"PAIR" => Ok(SocketType::Pair),
-        b"DEALER" => Ok(SocketType::Dealer),
-        b"ROUTER" => Ok(SocketType::Router),
-        b"PUB" => Ok(SocketType::Pub),
-        b"SUB" => Ok(SocketType::Sub),
-        b"XPUB" => Ok(SocketType::Xpub),
-        b"XSUB" => Ok(SocketType::Xsub),
-        b"REQ" => Ok(SocketType::Req),
-        b"REP" => Ok(SocketType::Rep),
-        b"PUSH" => Ok(SocketType::Push),
-        b"PULL" => Ok(SocketType::Pull),
-        _ => {
-            warn!(
-                "[HANDSHAKE] ZMTP READY parse: unknown Socket-Type value {:?}",
-                String::from_utf8_lossy(value)
-            );
-            Err(ZmtpError::Protocol)
-        }
     }
 }

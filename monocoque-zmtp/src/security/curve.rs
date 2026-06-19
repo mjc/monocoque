@@ -55,6 +55,7 @@ use tracing::{debug, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::codec::ZmtpError;
+use crate::security::protocol::{read_command_prefix, require_immediately_available_byte};
 use crate::security::zap::{ZapMechanism, ZapRequest, ZapStatus};
 
 /// CURVE command identifiers
@@ -132,18 +133,43 @@ impl CurveSecretKey {
     }
 
     /// Compute shared secret via ECDH
-    pub fn diffie_hellman(&self, peer_public: &CurvePublicKey) -> [u8; CURVE_KEY_SIZE] {
+    pub fn diffie_hellman(
+        &self,
+        peer_public: &CurvePublicKey,
+    ) -> Result<CurveSharedSecret, CurveError> {
         let shared = *self.0.diffie_hellman(&peer_public.to_x25519()).as_bytes();
         if shared == [0u8; CURVE_KEY_SIZE] {
-            return [0xff; CURVE_KEY_SIZE];
+            return Err(CurveError::ProtocolViolation);
         }
-        shared
+        Ok(CurveSharedSecret::from_bytes(shared))
     }
 }
 
 impl std::fmt::Debug for CurveSecretKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CurveSecretKey([REDACTED])")
+    }
+}
+
+/// CURVE shared secret (32 bytes).
+#[derive(Clone)]
+pub struct CurveSharedSecret([u8; CURVE_KEY_SIZE]);
+
+impl CurveSharedSecret {
+    /// Create from bytes.
+    pub const fn from_bytes(bytes: [u8; CURVE_KEY_SIZE]) -> Self {
+        Self(bytes)
+    }
+
+    /// Get raw bytes.
+    pub const fn as_bytes(&self) -> &[u8; CURVE_KEY_SIZE] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CurveSharedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CurveSharedSecret([REDACTED])")
     }
 }
 
@@ -178,8 +204,8 @@ struct CurveBox {
 
 impl CurveBox {
     /// Create new box from shared secret
-    fn new(shared_secret: &[u8; CURVE_KEY_SIZE]) -> Self {
-        let cipher = ChaCha20Poly1305::new(shared_secret.into());
+    fn new(shared_secret: &CurveSharedSecret) -> Self {
+        let cipher = ChaCha20Poly1305::new(shared_secret.as_bytes().into());
         Self { cipher }
     }
 
@@ -212,26 +238,213 @@ impl CurveBox {
     }
 }
 
-struct CurveMessageParts<'a> {
-    short_nonce: &'a [u8],
+struct CurveHello {
+    client_short_public: CurvePublicKey,
+}
+
+impl CurveHello {
+    async fn read_from<S>(stream: &mut S, timeout: Option<Duration>) -> Result<Self, ZmtpError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        use compio::buf::BufResult;
+        use monocoque_core::timeout::read_exact_with_timeout;
+
+        read_command_prefix(stream, CURVE_HELLO, timeout).await?;
+
+        let body = vec![0u8; 194];
+        let buf_result = read_exact_with_timeout(stream, body, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, body) = buf_result;
+        result?;
+
+        if body[0..2] != [1, 0] {
+            return Err(ZmtpError::Protocol);
+        }
+
+        let mut key_array = [0u8; CURVE_KEY_SIZE];
+        key_array.copy_from_slice(&body[74..106]);
+        if key_array == [0u8; CURVE_KEY_SIZE] {
+            return Err(ZmtpError::Protocol);
+        }
+        if body[114..194].iter().all(|&byte| byte == 0) {
+            return Err(ZmtpError::Protocol);
+        }
+
+        Ok(Self {
+            client_short_public: CurvePublicKey::from_bytes(key_array),
+        })
+    }
+}
+
+struct CurveWelcome {
+    server_short_public: CurvePublicKey,
+}
+
+impl CurveWelcome {
+    async fn read_from<S>(
+        stream: &mut S,
+        timeout: Option<Duration>,
+        expected_server_public: &CurvePublicKey,
+    ) -> Result<Self, ZmtpError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        use compio::buf::BufResult;
+        use monocoque_core::timeout::read_exact_with_timeout;
+
+        read_command_prefix(stream, CURVE_WELCOME, timeout).await?;
+
+        let server_short_key = vec![0u8; CURVE_KEY_SIZE];
+        let buf_result = read_exact_with_timeout(stream, server_short_key, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, server_short_key) = buf_result;
+        result?;
+
+        let mut key_array = [0u8; CURVE_KEY_SIZE];
+        key_array.copy_from_slice(&server_short_key);
+        if key_array == [0u8; CURVE_KEY_SIZE] || key_array != *expected_server_public.as_bytes() {
+            return Err(ZmtpError::Protocol);
+        }
+
+        let cookie = vec![0u8; 96];
+        let buf_result = read_exact_with_timeout(stream, cookie, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, _cookie) = buf_result;
+        result?;
+
+        Ok(Self {
+            server_short_public: CurvePublicKey::from_bytes(key_array),
+        })
+    }
+}
+
+struct CurveInitiate {
+    client_public: CurvePublicKey,
+}
+
+impl CurveInitiate {
+    async fn read_from<S>(stream: &mut S, timeout: Option<Duration>) -> Result<Self, ZmtpError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        use compio::buf::BufResult;
+        use monocoque_core::timeout::read_exact_with_timeout;
+
+        read_command_prefix(stream, CURVE_INITIATE, timeout).await?;
+
+        let body = vec![0u8; 248];
+        let buf_result = read_exact_with_timeout(stream, body, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, body) = buf_result;
+        result?;
+        if body[0..96].iter().all(|&byte| byte == 0) || body[104..248].iter().all(|&byte| byte == 0)
+        {
+            return Err(ZmtpError::Protocol);
+        }
+
+        let mut key_array = [0u8; CURVE_KEY_SIZE];
+        key_array.copy_from_slice(&body[104..136]);
+
+        Ok(Self {
+            client_public: CurvePublicKey::from_bytes(key_array),
+        })
+    }
+}
+
+struct CurveReady;
+
+impl CurveReady {
+    async fn read_from<S>(stream: &mut S, timeout: Option<Duration>) -> Result<Self, ZmtpError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        read_command_prefix(stream, CURVE_READY, timeout).await?;
+        require_immediately_available_byte(stream, Duration::from_millis(1)).await?;
+        Ok(Self)
+    }
+}
+
+struct CurveMessageFrame<'a> {
+    counter: u64,
     ciphertext: &'a [u8],
 }
 
-#[inline(always)]
-fn parse_curve_message(message: &[u8]) -> Result<CurveMessageParts<'_>, CurveError> {
-    let command_len = CURVE_MESSAGE.len();
-    if message.len() < command_len + CURVE_MESSAGE_NONCE_SIZE {
-        return Err(CurveError::ProtocolViolation);
+impl<'a> CurveMessageFrame<'a> {
+    fn parse(message: &'a [u8]) -> Result<Self, CurveError> {
+        let command_len = CURVE_MESSAGE.len();
+        if message.len() < command_len + CURVE_MESSAGE_NONCE_SIZE {
+            return Err(CurveError::ProtocolViolation);
+        }
+
+        if &message[..command_len] != CURVE_MESSAGE {
+            return Err(CurveError::ProtocolViolation);
+        }
+
+        let counter = u64::from_be_bytes(
+            message[command_len..command_len + CURVE_MESSAGE_NONCE_SIZE]
+                .try_into()
+                .map_err(|_| CurveError::ProtocolViolation)?,
+        );
+
+        Ok(Self {
+            counter,
+            ciphertext: &message[command_len + CURVE_MESSAGE_NONCE_SIZE..],
+        })
+    }
+}
+
+struct CurveSessionCipher {
+    cipher: CurveBox,
+    send_nonce: u64,
+    recv_nonce: u64,
+    send_prefix: [u8; 16],
+    recv_prefix: [u8; 16],
+}
+
+impl CurveSessionCipher {
+    fn new(shared_secret: CurveSharedSecret, send_prefix: [u8; 16], recv_prefix: [u8; 16]) -> Self {
+        Self {
+            cipher: CurveBox::new(&shared_secret),
+            send_nonce: 0,
+            recv_nonce: 0,
+            send_prefix,
+            recv_prefix,
+        }
     }
 
-    if &message[..command_len] != CURVE_MESSAGE {
-        return Err(CurveError::ProtocolViolation);
+    fn encrypt_message(&mut self, plaintext: &[u8]) -> Result<Bytes, CurveError> {
+        let mut nonce = [0u8; CURVE_NONCE_SIZE];
+        nonce[..16].copy_from_slice(&self.send_prefix);
+        nonce[16..].copy_from_slice(&self.send_nonce.to_be_bytes());
+        self.send_nonce += 1;
+
+        let ciphertext = self.cipher.encrypt(plaintext, &nonce)?;
+        let mut message = BytesMut::new();
+        message.extend_from_slice(CURVE_MESSAGE);
+        message.extend_from_slice(&nonce[16..]);
+        message.extend_from_slice(&ciphertext);
+        Ok(message.freeze())
     }
 
-    Ok(CurveMessageParts {
-        short_nonce: &message[command_len..command_len + CURVE_MESSAGE_NONCE_SIZE],
-        ciphertext: &message[command_len + CURVE_MESSAGE_NONCE_SIZE..],
-    })
+    fn decrypt_message(&mut self, message: &[u8]) -> Result<Bytes, CurveError> {
+        let frame = CurveMessageFrame::parse(message)?;
+        if frame.counter < self.recv_nonce {
+            return Err(CurveError::ProtocolViolation);
+        }
+
+        let mut nonce = [0u8; CURVE_NONCE_SIZE];
+        nonce[..16].copy_from_slice(&self.recv_prefix);
+        nonce[16..].copy_from_slice(&message[CURVE_MESSAGE.len()..CURVE_MESSAGE.len() + 8]);
+
+        let plaintext = self.cipher.decrypt(frame.ciphertext, &nonce)?;
+        self.recv_nonce = frame.counter.saturating_add(1);
+        Ok(Bytes::from(plaintext))
+    }
 }
 
 /// CURVE-specific errors
@@ -271,13 +484,8 @@ pub struct CurveClient {
     client_short_keypair: CurveKeyPair,
     /// Server's short-term public key (received in WELCOME)
     server_short_public: Option<CurvePublicKey>,
-    /// Send nonce counter
-    send_nonce: u64,
-    /// Receive nonce counter  -  needed for replay-attack detection when message
-    /// authentication is fully implemented.
-    recv_nonce: u64,
-    /// Encryption box for messages (after READY)
-    message_box: Option<CurveBox>,
+    /// Message cipher (after READY)
+    session_cipher: Option<CurveSessionCipher>,
 }
 
 impl CurveClient {
@@ -288,9 +496,7 @@ impl CurveClient {
             server_public,
             client_short_keypair: CurveKeyPair::generate(),
             server_short_public: None,
-            send_nonce: 0,
-            recv_nonce: 0,
-            message_box: None,
+            session_cipher: None,
         }
     }
 
@@ -355,46 +561,9 @@ impl CurveClient {
     where
         S: AsyncRead + Unpin,
     {
-        use compio::buf::BufResult;
-        use monocoque_core::timeout::read_exact_with_timeout;
-
         debug!("[CURVE CLIENT] Waiting for WELCOME");
-
-        // Read WELCOME command name including the length prefix.
-        let header = vec![0u8; CURVE_WELCOME.len()];
-        let buf_result = read_exact_with_timeout(stream, header, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, header) = buf_result;
-        result?;
-
-        if &header[..] != CURVE_WELCOME {
-            warn!("[CURVE CLIENT] Invalid WELCOME header");
-            return Err(ZmtpError::Protocol);
-        }
-
-        // Read server short-term public key (32 bytes)
-        let server_short_key = vec![0u8; CURVE_KEY_SIZE];
-        let buf_result = read_exact_with_timeout(stream, server_short_key, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, server_short_key) = buf_result;
-        result?;
-
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&server_short_key);
-        if key_array == [0u8; CURVE_KEY_SIZE] || key_array != *self.server_public.as_bytes() {
-            return Err(ZmtpError::Protocol);
-        }
-        self.server_short_public = Some(CurvePublicKey::from_bytes(key_array));
-
-        // Read encrypted cookie (96 bytes)
-        let cookie = vec![0u8; 96];
-        let buf_result = read_exact_with_timeout(stream, cookie, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, _cookie) = buf_result;
-        result?;
+        let welcome = CurveWelcome::read_from(stream, timeout, &self.server_public).await?;
+        self.server_short_public = Some(welcome.server_short_public);
 
         debug!("[CURVE CLIENT] Received WELCOME");
         Ok(())
@@ -444,29 +613,8 @@ impl CurveClient {
     where
         S: AsyncRead + Unpin,
     {
-        use compio::buf::BufResult;
-        use monocoque_core::timeout::read_exact_with_timeout;
-
         debug!("[CURVE CLIENT] Waiting for READY");
-
-        // Read READY command name including the length prefix.
-        let header = vec![0u8; CURVE_READY.len()];
-        let buf_result = read_exact_with_timeout(stream, header, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, header) = buf_result;
-        result?;
-
-        if &header[..] != CURVE_READY {
-            warn!("[CURVE CLIENT] Invalid READY header");
-            return Err(ZmtpError::Protocol);
-        }
-        let trailing = vec![0u8; 1];
-        match compio::time::timeout(Duration::from_millis(1), stream.read(trailing)).await {
-            Ok(BufResult(Ok(0), _)) | Err(_) => return Err(ZmtpError::Protocol),
-            Ok(BufResult(Ok(_), _)) => {}
-            Ok(BufResult(Err(_), _)) => return Err(ZmtpError::Protocol),
-        }
+        let _ready = CurveReady::read_from(stream, timeout).await?;
 
         // Compute shared secret for message encryption
         let server_short_public = self.server_short_public.ok_or(ZmtpError::Protocol)?;
@@ -474,9 +622,14 @@ impl CurveClient {
         let shared_secret = self
             .client_short_keypair
             .secret
-            .diffie_hellman(&server_short_public);
+            .diffie_hellman(&server_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
 
-        self.message_box = Some(CurveBox::new(&shared_secret));
+        self.session_cipher = Some(CurveSessionCipher::new(
+            shared_secret,
+            *b"CurveZMQMESSAGEC",
+            *b"CurveZMQMESSAGES",
+        ));
 
         debug!("[CURVE CLIENT] Handshake complete");
         Ok(())
@@ -484,52 +637,20 @@ impl CurveClient {
 
     /// Encrypt a message
     pub fn encrypt_message(&mut self, plaintext: &[u8]) -> Result<Bytes, CurveError> {
-        let message_box = self
-            .message_box
-            .as_ref()
+        let cipher = self
+            .session_cipher
+            .as_mut()
             .ok_or(CurveError::ProtocolViolation)?;
-
-        // Create nonce (24 bytes: "CurveZMQMESSAGEC" + 8-byte counter)
-        let mut nonce = [0u8; CURVE_NONCE_SIZE];
-        nonce[..16].copy_from_slice(b"CurveZMQMESSAGEC");
-        nonce[16..].copy_from_slice(&self.send_nonce.to_be_bytes());
-        self.send_nonce += 1;
-
-        let ciphertext = message_box.encrypt(plaintext, &nonce)?;
-
-        let mut message = BytesMut::new();
-        message.extend_from_slice(CURVE_MESSAGE);
-        message.extend_from_slice(&nonce[16..]); // Only send counter part
-        message.extend_from_slice(&ciphertext);
-
-        Ok(message.freeze())
+        cipher.encrypt_message(plaintext)
     }
 
     /// Decrypt a message
     pub fn decrypt_message(&mut self, message: &[u8]) -> Result<Bytes, CurveError> {
-        let parts = parse_curve_message(message)?;
-        let message_box = self
-            .message_box
-            .as_ref()
+        let cipher = self
+            .session_cipher
+            .as_mut()
             .ok_or(CurveError::ProtocolViolation)?;
-
-        // Reconstruct nonce
-        let mut nonce = [0u8; CURVE_NONCE_SIZE];
-        nonce[..16].copy_from_slice(b"CurveZMQMESSAGES");
-        let counter = u64::from_be_bytes(
-            parts
-                .short_nonce
-                .try_into()
-                .map_err(|_| CurveError::ProtocolViolation)?,
-        );
-        if counter < self.recv_nonce {
-            return Err(CurveError::ProtocolViolation);
-        }
-        nonce[16..].copy_from_slice(parts.short_nonce);
-
-        let plaintext = message_box.decrypt(parts.ciphertext, &nonce)?;
-        self.recv_nonce = counter.saturating_add(1);
-        Ok(Bytes::from(plaintext))
+        cipher.decrypt_message(message)
     }
 }
 
@@ -545,12 +666,7 @@ pub struct CurveServer {
     /// Client's long-term public key (received in INITIATE)
     client_public: Option<CurvePublicKey>,
     /// Send nonce counter
-    send_nonce: u64,
-    /// Receive nonce counter  -  needed for replay-attack detection when message
-    /// authentication is fully implemented.
-    recv_nonce: u64,
-    /// Encryption box for messages (after READY)
-    message_box: Option<CurveBox>,
+    session_cipher: Option<CurveSessionCipher>,
 }
 
 impl CurveServer {
@@ -561,9 +677,7 @@ impl CurveServer {
             server_short_keypair: CurveKeyPair::generate(),
             client_short_public: None,
             client_public: None,
-            send_nonce: 0,
-            recv_nonce: 0,
-            message_box: None,
+            session_cipher: None,
         }
     }
 
@@ -594,44 +708,9 @@ impl CurveServer {
     where
         S: AsyncRead + Unpin,
     {
-        use compio::buf::BufResult;
-        use monocoque_core::timeout::read_exact_with_timeout;
-
         debug!("[CURVE SERVER] Waiting for HELLO");
-
-        // Read HELLO command name including the length prefix.
-        let header = vec![0u8; CURVE_HELLO.len()];
-        let buf_result = read_exact_with_timeout(stream, header, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, header) = buf_result;
-        result?;
-
-        if &header[..] != CURVE_HELLO {
-            warn!("[CURVE SERVER] Invalid HELLO header");
-            return Err(ZmtpError::Protocol);
-        }
-
-        let body = vec![0u8; 194];
-        let buf_result = read_exact_with_timeout(stream, body, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, body) = buf_result;
-        result?;
-
-        if body[0..2] != [1, 0] {
-            return Err(ZmtpError::Protocol);
-        }
-
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&body[74..106]);
-        if key_array == [0u8; CURVE_KEY_SIZE] {
-            return Err(ZmtpError::Protocol);
-        }
-        if body[114..194].iter().all(|&byte| byte == 0) {
-            return Err(ZmtpError::Protocol);
-        }
-        self.client_short_public = Some(CurvePublicKey::from_bytes(key_array));
+        let hello = CurveHello::read_from(stream, timeout).await?;
+        self.client_short_public = Some(hello.client_short_public);
 
         debug!("[CURVE SERVER] Received HELLO");
         Ok(())
@@ -676,41 +755,13 @@ impl CurveServer {
     where
         S: AsyncRead + Unpin,
     {
-        use compio::buf::BufResult;
-        use monocoque_core::timeout::read_exact_with_timeout;
-
         debug!("[CURVE SERVER] Waiting for INITIATE");
-
-        // Read INITIATE command name including the length prefix.
-        let header = vec![0u8; CURVE_INITIATE.len()];
-        let buf_result = read_exact_with_timeout(stream, header, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, header) = buf_result;
-        result?;
-
-        if &header[..] != CURVE_INITIATE {
-            warn!("[CURVE SERVER] Invalid INITIATE header");
-            return Err(ZmtpError::Protocol);
-        }
         if self.client_short_public.is_none() {
             return Err(ZmtpError::Protocol);
         }
 
-        let body = vec![0u8; 248];
-        let buf_result = read_exact_with_timeout(stream, body, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, body) = buf_result;
-        result?;
-        if body[0..96].iter().all(|&byte| byte == 0) || body[104..248].iter().all(|&byte| byte == 0)
-        {
-            return Err(ZmtpError::Protocol);
-        }
-
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&body[104..136]);
-        self.client_public = Some(CurvePublicKey::from_bytes(key_array));
+        let initiate = CurveInitiate::read_from(stream, timeout).await?;
+        self.client_public = Some(initiate.client_public);
 
         debug!("[CURVE SERVER] Received INITIATE");
         Ok(())
@@ -743,9 +794,14 @@ impl CurveServer {
         let shared_secret = self
             .server_short_keypair
             .secret
-            .diffie_hellman(&client_short_public);
+            .diffie_hellman(&client_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
 
-        self.message_box = Some(CurveBox::new(&shared_secret));
+        self.session_cipher = Some(CurveSessionCipher::new(
+            shared_secret,
+            *b"CurveZMQMESSAGES",
+            *b"CurveZMQMESSAGEC",
+        ));
 
         debug!("[CURVE SERVER] Handshake complete");
         Ok(())
@@ -753,52 +809,20 @@ impl CurveServer {
 
     /// Encrypt a message
     pub fn encrypt_message(&mut self, plaintext: &[u8]) -> Result<Bytes, CurveError> {
-        let message_box = self
-            .message_box
-            .as_ref()
+        let cipher = self
+            .session_cipher
+            .as_mut()
             .ok_or(CurveError::ProtocolViolation)?;
-
-        // Create nonce (24 bytes: "CurveZMQMESSAGES" + 8-byte counter)
-        let mut nonce = [0u8; CURVE_NONCE_SIZE];
-        nonce[..16].copy_from_slice(b"CurveZMQMESSAGES");
-        nonce[16..].copy_from_slice(&self.send_nonce.to_be_bytes());
-        self.send_nonce += 1;
-
-        let ciphertext = message_box.encrypt(plaintext, &nonce)?;
-
-        let mut message = BytesMut::new();
-        message.extend_from_slice(CURVE_MESSAGE);
-        message.extend_from_slice(&nonce[16..]); // Only send counter part
-        message.extend_from_slice(&ciphertext);
-
-        Ok(message.freeze())
+        cipher.encrypt_message(plaintext)
     }
 
     /// Decrypt a message
     pub fn decrypt_message(&mut self, message: &[u8]) -> Result<Bytes, CurveError> {
-        let parts = parse_curve_message(message)?;
-        let message_box = self
-            .message_box
-            .as_ref()
+        let cipher = self
+            .session_cipher
+            .as_mut()
             .ok_or(CurveError::ProtocolViolation)?;
-
-        // Reconstruct nonce
-        let mut nonce = [0u8; CURVE_NONCE_SIZE];
-        nonce[..16].copy_from_slice(b"CurveZMQMESSAGEC");
-        let counter = u64::from_be_bytes(
-            parts
-                .short_nonce
-                .try_into()
-                .map_err(|_| CurveError::ProtocolViolation)?,
-        );
-        if counter < self.recv_nonce {
-            return Err(CurveError::ProtocolViolation);
-        }
-        nonce[16..].copy_from_slice(parts.short_nonce);
-
-        let plaintext = message_box.decrypt(parts.ciphertext, &nonce)?;
-        self.recv_nonce = counter.saturating_add(1);
-        Ok(Bytes::from(plaintext))
+        cipher.decrypt_message(message)
     }
 }
 
@@ -974,10 +998,10 @@ mod tests {
         let alice = CurveKeyPair::generate();
         let bob = CurveKeyPair::generate();
 
-        let alice_shared = alice.secret.diffie_hellman(&bob.public);
-        let bob_shared = bob.secret.diffie_hellman(&alice.public);
+        let alice_shared = alice.secret.diffie_hellman(&bob.public).unwrap();
+        let bob_shared = bob.secret.diffie_hellman(&alice.public).unwrap();
 
-        assert_eq!(alice_shared, bob_shared);
+        assert_eq!(alice_shared.as_bytes(), bob_shared.as_bytes());
     }
 
     #[test]
@@ -987,16 +1011,15 @@ mod tests {
 
         let shared = secret.diffie_hellman(&low_order_public);
 
-        assert_ne!(
-            shared, [0u8; CURVE_KEY_SIZE],
+        assert!(
+            shared.is_err(),
             "CURVE accepted a non-contributory X25519 peer key and produced an all-zero shared secret"
         );
     }
 
     #[test]
     fn test_curve_box_encrypt_decrypt() {
-        let shared_secret = [42u8; CURVE_KEY_SIZE];
-        let box_ = CurveBox::new(&shared_secret);
+        let box_ = curve_box([42u8; CURVE_KEY_SIZE]);
 
         let plaintext = b"Hello, CURVE!";
         let nonce = [1u8; CURVE_NONCE_SIZE];
@@ -1009,8 +1032,7 @@ mod tests {
 
     #[test]
     fn curve_box_uses_message_counter_bytes_in_aead_nonce() {
-        let shared_secret = [42u8; CURVE_KEY_SIZE];
-        let box_ = CurveBox::new(&shared_secret);
+        let box_ = curve_box([42u8; CURVE_KEY_SIZE]);
         let plaintext = b"same plaintext";
 
         let mut nonce_one = [0u8; CURVE_NONCE_SIZE];
@@ -1075,6 +1097,27 @@ mod tests {
         initiate.extend_from_slice(&[0u8; 8]);
         initiate.extend_from_slice(&[0u8; 144]);
         initiate
+    }
+
+    fn curve_box(shared_secret: [u8; CURVE_KEY_SIZE]) -> CurveBox {
+        let shared_secret = CurveSharedSecret::from_bytes(shared_secret);
+        CurveBox::new(&shared_secret)
+    }
+
+    fn client_session_cipher(shared_secret: &[u8; CURVE_KEY_SIZE]) -> CurveSessionCipher {
+        CurveSessionCipher::new(
+            CurveSharedSecret::from_bytes(*shared_secret),
+            *b"CurveZMQMESSAGEC",
+            *b"CurveZMQMESSAGES",
+        )
+    }
+
+    fn server_session_cipher(shared_secret: &[u8; CURVE_KEY_SIZE]) -> CurveSessionCipher {
+        CurveSessionCipher::new(
+            CurveSharedSecret::from_bytes(*shared_secret),
+            *b"CurveZMQMESSAGES",
+            *b"CurveZMQMESSAGEC",
+        )
     }
 
     async fn server_recv_initiate_result(
@@ -1164,8 +1207,7 @@ mod tests {
 
     #[test]
     fn client_decrypt_message_accepts_valid_curve_message_command_header() {
-        let shared_secret = [42u8; CURVE_KEY_SIZE];
-        let box_ = CurveBox::new(&shared_secret);
+        let box_ = curve_box([42u8; CURVE_KEY_SIZE]);
 
         let mut nonce = [0u8; CURVE_NONCE_SIZE];
         nonce[..16].copy_from_slice(b"CurveZMQMESSAGES");
@@ -1180,7 +1222,7 @@ mod tests {
         let client_keypair = CurveKeyPair::generate();
         let server_public = CurveKeyPair::generate().public;
         let mut client = CurveClient::new(client_keypair, server_public);
-        client.message_box = Some(CurveBox::new(&shared_secret));
+        client.session_cipher = Some(client_session_cipher(&[42u8; CURVE_KEY_SIZE]));
 
         let plaintext = client.decrypt_message(&frame).unwrap();
 
@@ -1189,8 +1231,7 @@ mod tests {
 
     #[test]
     fn decrypt_message_rejects_replayed_message_counter() {
-        let shared_secret = [42u8; CURVE_KEY_SIZE];
-        let box_ = CurveBox::new(&shared_secret);
+        let box_ = curve_box([42u8; CURVE_KEY_SIZE]);
 
         let mut nonce = [0u8; CURVE_NONCE_SIZE];
         nonce[..16].copy_from_slice(b"CurveZMQMESSAGES");
@@ -1205,7 +1246,7 @@ mod tests {
         let client_keypair = CurveKeyPair::generate();
         let server_public = CurveKeyPair::generate().public;
         let mut client = CurveClient::new(client_keypair, server_public);
-        client.message_box = Some(CurveBox::new(&shared_secret));
+        client.session_cipher = Some(client_session_cipher(&[42u8; CURVE_KEY_SIZE]));
 
         client.decrypt_message(&frame).unwrap();
         let replay_result = client.decrypt_message(&frame);
@@ -1286,8 +1327,7 @@ mod tests {
 
     #[test]
     fn server_decrypt_message_accepts_valid_curve_message_command_header() {
-        let shared_secret = [43u8; CURVE_KEY_SIZE];
-        let box_ = CurveBox::new(&shared_secret);
+        let box_ = curve_box([43u8; CURVE_KEY_SIZE]);
 
         let mut nonce = [0u8; CURVE_NONCE_SIZE];
         nonce[..16].copy_from_slice(b"CurveZMQMESSAGEC");
@@ -1301,7 +1341,7 @@ mod tests {
 
         let server_keypair = CurveKeyPair::generate();
         let mut server = CurveServer::new(server_keypair);
-        server.message_box = Some(CurveBox::new(&shared_secret));
+        server.session_cipher = Some(server_session_cipher(&[43u8; CURVE_KEY_SIZE]));
 
         let plaintext = server.decrypt_message(&frame).unwrap();
 
@@ -1313,7 +1353,7 @@ mod tests {
         let client_keypair = CurveKeyPair::generate();
         let server_public = CurveKeyPair::generate().public;
         let mut client = CurveClient::new(client_keypair, server_public);
-        client.message_box = Some(CurveBox::new(&[42u8; CURVE_KEY_SIZE]));
+        client.session_cipher = Some(client_session_cipher(&[42u8; CURVE_KEY_SIZE]));
 
         let mut frame = BytesMut::new();
         frame.extend_from_slice(b"\x05READY");
@@ -1331,7 +1371,7 @@ mod tests {
         let client_keypair = CurveKeyPair::generate();
         let server_public = CurveKeyPair::generate().public;
         let mut client = CurveClient::new(client_keypair, server_public);
-        client.message_box = Some(CurveBox::new(&[42u8; CURVE_KEY_SIZE]));
+        client.session_cipher = Some(client_session_cipher(&[42u8; CURVE_KEY_SIZE]));
 
         assert!(matches!(
             client.decrypt_message(CURVE_MESSAGE),

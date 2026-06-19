@@ -32,7 +32,7 @@
 //! ```
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use flume::{Receiver, Sender};
 use std::io;
 
@@ -49,11 +49,11 @@ pub type InprocReceiver = Receiver<InprocMessage>;
 static INPROC_REGISTRY: once_cell::sync::Lazy<DashMap<String, InprocSender>> =
     once_cell::sync::Lazy::new(DashMap::new);
 
-/// Registry of server→client senders for bidirectional inproc connections.
+/// Registry of server→client receivers for bidirectional inproc connections.
 ///
-/// When `bind_inproc_bidi` is called, the server→client sender is registered
+/// When `bind_inproc_bidi` is called, the server→client receiver is registered
 /// here so that `connect_inproc_bidi` can retrieve it to receive server replies.
-static INPROC_REPLY_REGISTRY: once_cell::sync::Lazy<DashMap<String, InprocSender>> =
+static INPROC_REPLY_REGISTRY: once_cell::sync::Lazy<DashMap<String, InprocReceiver>> =
     once_cell::sync::Lazy::new(DashMap::new);
 
 /// Bind to an inproc endpoint and return sender/receiver pair.
@@ -93,15 +93,17 @@ pub fn bind_inproc(endpoint: &str) -> io::Result<(InprocSender, InprocReceiver)>
     // Create unbounded channel for message passing
     let (tx, rx) = flume::unbounded();
 
-    // Try to insert into registry
-    if INPROC_REGISTRY
-        .insert(name.to_string(), tx.clone())
-        .is_some()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!("inproc endpoint '{name}' is already bound"),
-        ));
+    // Register only if the endpoint is not already occupied.
+    match INPROC_REGISTRY.entry(name.to_string()) {
+        Entry::Occupied(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("inproc endpoint '{name}' is already bound"),
+            ));
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(tx.clone());
+        }
     }
 
     Ok((tx, rx))
@@ -190,20 +192,18 @@ pub fn unbind_inproc(endpoint: &str) -> io::Result<()> {
 
 /// Bind to an inproc endpoint for bidirectional communication.
 ///
-/// Returns `(to_clients_tx, from_clients_rx)`:
+/// Returns `(to_clients_tx, from_clients_rx)` for the server side:
 /// - `to_clients_tx`: The server uses this to send replies back to the client.
-///   It is registered so that `connect_inproc_bidi` can retrieve it.
 /// - `from_clients_rx`: The server reads client messages from this.
 ///
-/// The caller (server side) owns both halves.  The client side
-/// (`connect_inproc_bidi`) gets a `(to_server_tx, from_server_rx)` pair.
+/// The matching client half is obtained by calling [`connect_inproc_bidi`].
 ///
 /// # Errors
 ///
 /// Returns an error if the endpoint is already bound.
 pub fn bind_inproc_bidi(
     endpoint: &str,
-) -> io::Result<(InprocSender, InprocReceiver, InprocSender, InprocReceiver)> {
+) -> io::Result<(InprocSender, InprocReceiver)> {
     let name = validate_and_extract_name(endpoint)?;
 
     // Channel: client → server
@@ -211,27 +211,35 @@ pub fn bind_inproc_bidi(
     // Channel: server → client
     let (server_to_client_tx, server_to_client_rx) = flume::unbounded::<InprocMessage>();
 
-    // Register the client→server sender (clients call connect_inproc to get this)
-    if INPROC_REGISTRY
-        .insert(name.to_string(), client_to_server_tx.clone())
-        .is_some()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!("inproc endpoint '{name}' is already bound"),
-        ));
+    // Register the client→server sender only if the endpoint is not occupied.
+    match INPROC_REGISTRY.entry(name.to_string()) {
+        Entry::Occupied(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("inproc endpoint '{name}' is already bound"),
+            ));
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(client_to_server_tx.clone());
+        }
     }
 
-    // Register the server→client sender so connect_inproc_bidi can retrieve it
-    INPROC_REPLY_REGISTRY.insert(name.to_string(), server_to_client_tx.clone());
+    // Register the server→client receiver so connect_inproc_bidi can retrieve it.
+    match INPROC_REPLY_REGISTRY.entry(name.to_string()) {
+        Entry::Occupied(_) => {
+            INPROC_REGISTRY.remove(name);
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("inproc endpoint '{name}' is already bound"),
+            ));
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(server_to_client_rx);
+        }
+    }
 
-    // Return all four channel ends
-    Ok((
-        server_to_client_tx,
-        client_to_server_rx,
-        client_to_server_tx,
-        server_to_client_rx,
-    ))
+    // Return the server-side channel ends.
+    Ok((server_to_client_tx, client_to_server_rx))
 }
 
 /// Connect to an inproc endpoint for bidirectional communication.
@@ -258,10 +266,10 @@ pub fn connect_inproc_bidi(endpoint: &str) -> io::Result<(InprocSender, InprocRe
             )
         })?;
 
-    // Get the reply channel the server registered for us
+    // Get the reply channel the server registered for us.
     let from_server = INPROC_REPLY_REGISTRY
-        .get(name)
-        .map(|r| r.clone())
+        .remove(name)
+        .map(|(_, rx)| rx)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -271,33 +279,7 @@ pub fn connect_inproc_bidi(endpoint: &str) -> io::Result<(InprocSender, InprocRe
                 ),
             )
         })?;
-
-    // The registry holds the server→client SENDER.  We need to create a fresh
-    // (tx, rx) pair: our from_server rx and tell the server to use our new tx.
-    // Because the server already has its rx from bind_inproc_bidi, we simply
-    // create a new channel and give its tx to the server registry so the server
-    // can write to us, and keep the rx for ourselves.
-    let (our_reply_tx, our_reply_rx) = flume::unbounded::<InprocMessage>();
-
-    // Replace the registry entry with our fresh tx so the server will write to us.
-    // (This means only one client is supported per endpoint at a time, which
-    // is the correct semantic for a DEALER↔ROUTER or REQ↔REP pair.)
-    INPROC_REPLY_REGISTRY.insert(name.to_string(), our_reply_tx);
-
-    // The server also needs to be told to write to us  -  we accomplish this by
-    // updating the reply registry.  The server reads from the channel whose tx
-    // we just stored.  But the server's *rx* was already created in
-    // bind_inproc_bidi and is owned by the caller there.
-    //
-    // For simplicity, we just use the original server_to_client_tx (from_server)
-    // to send back  -  the server already has server_to_client_rx.
-    // Drop the original from_server (it was just a reference clone of the
-    // server→client tx) and use the server_to_client_tx we stored in the
-    // registry as the SENDER that the server will use.  The caller of
-    // bind_inproc_bidi got server_to_client_rx directly.
-    let _ = from_server; // we replaced it in the registry with our_reply_tx
-
-    Ok((to_server, our_reply_rx))
+    Ok((to_server, from_server))
 }
 
 /// List all currently bound inproc endpoints.
@@ -351,6 +333,15 @@ fn validate_and_extract_name(endpoint: &str) -> io::Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_endpoint(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        format!("inproc://{prefix}-{nanos}")
+    }
 
     #[test]
     fn test_validate_endpoint() {
@@ -377,6 +368,28 @@ mod tests {
 
         // Cleanup
         let _ = unbind_inproc(endpoint);
+    }
+
+    #[test]
+    fn test_bind_duplicate_keeps_original_endpoint_live() {
+        let endpoint = unique_endpoint("test-duplicate-live");
+
+        let (_tx, rx) = bind_inproc(&endpoint).unwrap();
+
+        let duplicate = bind_inproc(&endpoint);
+        assert!(duplicate.is_err());
+        assert_eq!(duplicate.unwrap_err().kind(), io::ErrorKind::AddrInUse);
+
+        let client = connect_inproc(&endpoint).unwrap();
+        let msg = vec![Bytes::from("Hello, inproc!")];
+
+        client.send(msg.clone()).unwrap();
+        let received = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("original receiver should still receive messages");
+        assert_eq!(received, msg);
+
+        let _ = unbind_inproc(&endpoint);
     }
 
     #[test]
