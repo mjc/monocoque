@@ -124,6 +124,14 @@ where
                             }
                             continue;
                         }
+                        if let Some(max_msg_size) = self.base.options.max_msg_size {
+                            if frame.payload.len() > max_msg_size {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "received message frame exceeds max_msg_size",
+                                ));
+                            }
+                        }
                         let more = frame.more();
                         self.frames.push(frame.payload);
 
@@ -535,3 +543,32 @@ impl PairSocket<InprocStream> {
 }
 
 crate::impl_socket_trait!(PairSocket<S>, SocketType::Pair);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use compio::net::{TcpListener, TcpStream};
+
+    #[compio::test]
+    async fn recv_rejects_message_larger_than_configured_max_msg_size() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = compio::runtime::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let options = SocketOptions::new().with_max_msg_size(Some(1));
+            let mut server = PairSocket::with_options(stream, options).await.unwrap();
+            server.recv().await
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut client = PairSocket::new(stream).await.unwrap();
+        client.send(vec![Bytes::from_static(b"xx")]).await.unwrap();
+
+        let recv_result = server_task.await;
+        assert!(
+            recv_result.is_err(),
+            "receiver accepted a frame larger than SocketOptions::max_msg_size"
+        );
+    }
+}
