@@ -201,9 +201,7 @@ pub fn unbind_inproc(endpoint: &str) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the endpoint is already bound.
-pub fn bind_inproc_bidi(
-    endpoint: &str,
-) -> io::Result<(InprocSender, InprocReceiver)> {
+pub fn bind_inproc_bidi(endpoint: &str) -> io::Result<(InprocSender, InprocReceiver)> {
     let name = validate_and_extract_name(endpoint)?;
 
     // Channel: client → server

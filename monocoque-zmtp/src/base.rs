@@ -146,7 +146,6 @@ where
     //
     // Stub note: PING sending is wired into `check_heartbeat()`.
     // Timeout-based disconnection is noted below and left for a future PR.
-
     /// Instant of the last received frame on this connection.
     ///
     /// `None` before the first frame is received after the handshake, or
@@ -408,10 +407,7 @@ where
         // ── Check PONG timeout ───────────────────────────────────────────
         if self.awaiting_pong {
             if let Some(ping_at) = self.ping_sent_at {
-                let timeout = self
-                    .options
-                    .heartbeat_timeout
-                    .unwrap_or(ivl); // default to ivl when not set
+                let timeout = self.options.heartbeat_timeout.unwrap_or(ivl); // default to ivl when not set
                 if now.duration_since(ping_at) > timeout {
                     warn!(
                         "[SocketBase] Heartbeat PONG not received within {:?}  -  peer considered dead",
@@ -485,7 +481,10 @@ where
         let slab = self.arena.alloc_mut(self.options.read_buffer_size);
 
         // Get stream reference only for I/O
-        let stream = self.stream.as_mut().expect("BUG: stream must be Some  -  checked is_none() above");
+        let stream = self
+            .stream
+            .as_mut()
+            .expect("BUG: stream must be Some  -  checked is_none() above");
 
         // Apply recv timeout
         let BufResult(result, slab) = match self.options.recv_timeout {
@@ -842,7 +841,11 @@ mod tests {
         // Byte 1: body length = 5 (\x04PING) + 2 (TTL) = 7
         assert_eq!(frame[1], 7, "PING body length must be 7 bytes");
         // Bytes 2-6: "\x04PING" (1-byte name-len + "PING")
-        assert_eq!(&frame[2..7], b"\x04PING", "PING body must start with \\x04PING");
+        assert_eq!(
+            &frame[2..7],
+            b"\x04PING",
+            "PING body must start with \\x04PING"
+        );
         // Bytes 7-8: TTL big-endian
         let ttl = u16::from_be_bytes([frame[7], frame[8]]);
         assert_eq!(ttl, 100, "PING TTL field must match the argument");
@@ -885,8 +888,8 @@ mod tests {
         // The logic here is purely tested through the helper functions.
         // Full integration is covered by the heartbeat field initialisation
         // verified in the constructor tests below.
-        let _ = build_ping_frame(0);  // smoke-test: no panic
-        let _ = build_pong_frame();   // smoke-test: no panic
+        let _ = build_ping_frame(0); // smoke-test: no panic
+        let _ = build_pong_frame(); // smoke-test: no panic
     }
 
     /// Verify that the PING frame's TTL is encoded as big-endian in tenths of
