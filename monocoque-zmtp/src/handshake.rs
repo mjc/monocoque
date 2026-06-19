@@ -21,7 +21,7 @@
 use crate::codec::ZmtpError;
 use crate::session::SocketType;
 use crate::utils::{build_ready, encode_frame, FLAG_COMMAND};
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use compio::buf::BufResult;
 use compio::io::{AsyncRead, AsyncWrite};
 use monocoque_core::options::SocketOptions;
@@ -103,7 +103,10 @@ where
             ZmtpError::Protocol
         })?;
     write_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 1: Failed to write ZMTP greeting bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 1: Failed to write ZMTP greeting bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -121,7 +124,10 @@ where
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 2: Failed to read ZMTP greeting bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 2: Failed to read ZMTP greeting bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!("[HANDSHAKE] Step 2 DONE: Received peer greeting (64 bytes)");
@@ -155,11 +161,17 @@ where
     let BufResult(write_res, _) = write_all_with_timeout(stream, ready_frame.clone(), timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 4: Failed to send ZMTP READY command: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 4: Failed to send ZMTP READY command: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
     write_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 4: Failed to write ZMTP READY command bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 4: Failed to write ZMTP READY command bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -173,11 +185,17 @@ where
     let BufResult(read_res, header_buf) = read_exact_with_timeout(stream, header_buf, timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY frame header: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to receive ZMTP READY frame header: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY frame header bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 5: Failed to read ZMTP READY frame header bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!(
@@ -204,11 +222,17 @@ where
         let BufResult(read_res, len_buf) = read_exact_with_timeout(stream, len_buf, timeout)
             .await
             .map_err(|e| {
-                warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY long-frame length: {}", e);
+                warn!(
+                    "[HANDSHAKE] Step 5: Failed to receive ZMTP READY long-frame length: {}",
+                    e
+                );
                 ZmtpError::Protocol
             })?;
         read_res.map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY long-frame length bytes: {}", e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to read ZMTP READY long-frame length bytes: {}",
+                e
+            );
             ZmtpError::Protocol
         })?;
         u64::from_be_bytes(len_buf) as usize
@@ -230,11 +254,17 @@ where
     let BufResult(read_res, body_buf) = read_exact_with_timeout(stream, body_buf, timeout)
         .await
         .map_err(|e| {
-            warn!("[HANDSHAKE] Step 5: Failed to receive ZMTP READY body ({} bytes): {}", body_len, e);
+            warn!(
+                "[HANDSHAKE] Step 5: Failed to receive ZMTP READY body ({} bytes): {}",
+                body_len, e
+            );
             ZmtpError::Protocol
         })?;
     read_res.map_err(|e| {
-        warn!("[HANDSHAKE] Step 5: Failed to read ZMTP READY body bytes: {}", e);
+        warn!(
+            "[HANDSHAKE] Step 5: Failed to read ZMTP READY body bytes: {}",
+            e
+        );
         ZmtpError::Protocol
     })?;
     debug!("[HANDSHAKE] Step 5c DONE: Read {} bytes of body", body_len);
@@ -369,7 +399,7 @@ fn build_greeting_with_mechanism(mechanism: SecurityMechanism, options: &SocketO
     let mech_name = mechanism.as_greeting_bytes();
     b.extend_from_slice(mech_name);
     let padding = 20usize.saturating_sub(mech_name.len());
-    b.extend_from_slice(&vec![0u8; padding]);
+    b.put_bytes(0, padding);
 
     // As-server flag (byte 32): 1 if this side acts as CURVE/PLAIN server
     let as_server = match mechanism {
