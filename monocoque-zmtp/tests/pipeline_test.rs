@@ -6,9 +6,9 @@
 //! Coordination between threads uses `std::sync::mpsc` channels.
 
 use bytes::Bytes;
+use monocoque_core::options::SocketOptions;
 use monocoque_zmtp::pull::PullSocket;
 use monocoque_zmtp::push::PushSocket;
-use monocoque_core::options::SocketOptions;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;

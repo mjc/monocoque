@@ -384,9 +384,12 @@ impl XSubSocket<TcpStream> {
 
     /// Try to reconnect to the stored endpoint, re-sending all active subscriptions.
     pub async fn try_reconnect(&mut self) -> io::Result<()> {
-        self.base.try_reconnect(crate::session::SocketType::Xsub).await?;
+        self.base
+            .try_reconnect(crate::session::SocketType::Xsub)
+            .await?;
         // Re-send all subscriptions to the fresh connection
-        let prefixes: Vec<bytes::Bytes> = self.subscriptions
+        let prefixes: Vec<bytes::Bytes> = self
+            .subscriptions
             .subscriptions()
             .iter()
             .map(|s| s.prefix.clone())

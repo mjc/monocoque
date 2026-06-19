@@ -131,16 +131,15 @@ async fn subscription_reader(
                 loop {
                     match decoder.decode(&mut recv_buf) {
                         Ok(Some(frame)) => {
-                            if let Some(event) =
-                                SubscriptionEvent::from_message(&frame.payload)
-                            {
+                            if let Some(event) = SubscriptionEvent::from_message(&frame.payload) {
                                 let mut subs = subscriptions.write();
                                 match event {
                                     SubscriptionEvent::Subscribe(prefix) => {
                                         if !subs.contains(&prefix) {
                                             trace!(
                                                 "[PUB] Subscriber {} subscribed to {:?}",
-                                                id, prefix
+                                                id,
+                                                prefix
                                             );
                                             subs.push(prefix);
                                         }
@@ -148,7 +147,8 @@ async fn subscription_reader(
                                     SubscriptionEvent::Unsubscribe(prefix) => {
                                         trace!(
                                             "[PUB] Subscriber {} unsubscribed from {:?}",
-                                            id, prefix
+                                            id,
+                                            prefix
                                         );
                                         subs.retain(|s| s != &prefix);
                                     }

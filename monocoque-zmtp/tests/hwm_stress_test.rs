@@ -9,8 +9,8 @@
 use bytes::Bytes;
 use monocoque_core::options::SocketOptions;
 use monocoque_zmtp::dealer::DealerSocket;
-use monocoque_zmtp::router::RouterSocket;
 use monocoque_zmtp::publisher::PubSocket as InternalPub;
+use monocoque_zmtp::router::RouterSocket;
 use monocoque_zmtp::subscriber::SubSocket;
 use std::sync::mpsc;
 use std::thread;

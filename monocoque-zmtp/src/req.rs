@@ -483,7 +483,6 @@ where
     pub fn events(&self) -> u32 {
         self.base.events()
     }
-
 }
 
 #[cfg(test)]

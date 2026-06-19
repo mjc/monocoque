@@ -142,11 +142,15 @@ where
         crate::codec::encode_multipart(&[payload], &mut wire);
         let wire = wire.freeze();
 
-        trace!("[SUB] Sending subscription event ({} wire bytes)", wire.len());
+        trace!(
+            "[SUB] Sending subscription event ({} wire bytes)",
+            wire.len()
+        );
 
-        let stream = self.base.stream.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
-        })?;
+        let stream =
+            self.base.stream.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Socket not connected")
+            })?;
         let data = wire.to_vec();
         let BufResult(result, _) = stream.write_all(data).await;
         result?;
@@ -180,10 +184,10 @@ where
                                     self.base.note_pong_received();
                                 }
                                 continue;
-                        }
-                        self.base.reject_oversized_frame(frame.payload.len())?;
-                        let more = frame.more();
-                        self.frames.push(frame.payload);
+                            }
+                            self.base.reject_oversized_frame(frame.payload.len())?;
+                            let more = frame.more();
+                            self.frames.push(frame.payload);
 
                             if !more {
                                 // Complete message received
@@ -191,9 +195,9 @@ where
                                 trace!("[SUB] Received {} frames", msg.len());
 
                                 // Check if message matches any subscription
-                                let matches = msg
-                                    .first()
-                                    .is_some_and(|first_frame| topic_matches_prefixes(first_frame, &self.subscriptions));
+                                let matches = msg.first().is_some_and(|first_frame| {
+                                    topic_matches_prefixes(first_frame, &self.subscriptions)
+                                });
 
                                 if matches {
                                     return Ok(Some(msg));

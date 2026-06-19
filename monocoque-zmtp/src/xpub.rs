@@ -284,7 +284,8 @@ impl XPubSocket {
                                         ));
                                     }
                                 }
-                                if let Some(event) = SubscriptionEvent::from_message(&frame.payload) {
+                                if let Some(event) = SubscriptionEvent::from_message(&frame.payload)
+                                {
                                     trace!(
                                         "[XPUB] Subscription event from subscriber {}: {:?}",
                                         sub.id,
