@@ -223,6 +223,7 @@ impl ZapClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inproc_stream::InprocStream;
     use crate::security::zap::next_request_id;
 
     // ZAP client tests require a running ZAP server.
