@@ -408,10 +408,7 @@ mod tests {
                 .iter()
                 .any(|ip| request.address.starts_with(ip.as_str()))
             {
-                return ZapResponse::failure(
-                    request.request_id.clone(),
-                    format!("Address {} is blocked", request.address),
-                );
+                return ZapResponse::failure(request.request_id.clone(), "Address is blocked");
             }
             ZapResponse::success(request.request_id.clone(), String::new())
         }
