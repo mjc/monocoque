@@ -47,6 +47,12 @@ impl<S> PairSocket<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    async fn send_frames(&mut self, msg: &[Bytes]) -> io::Result<()> {
+        self.base.write_buf.clear();
+        encode_multipart(msg, &mut self.base.write_buf);
+        self.base.write_from_buf().await
+    }
+
     /// Create a new PAIR socket from a stream with default buffer configuration.
     pub async fn new(stream: S) -> io::Result<Self> {
         Self::with_options(stream, SocketOptions::default()).await
@@ -90,12 +96,7 @@ where
     pub async fn send(&mut self, msg: Vec<Bytes>) -> io::Result<()> {
         trace!("[PAIR] Sending {} frames", msg.len());
 
-        // Encode message into write_buf
-        self.base.write_buf.clear();
-        encode_multipart(&msg, &mut self.base.write_buf);
-
-        // Delegate to base for writing
-        self.base.write_from_buf().await?;
+        self.send_frames(&msg).await?;
 
         trace!("[PAIR] Message sent successfully");
         Ok(())
@@ -424,7 +425,7 @@ impl PairSocket<TcpStream> {
                 self.try_reconnect().await?;
             }
 
-            match self.send(msg.clone()).await {
+            match self.send_frames(&msg).await {
                 Ok(()) => return Ok(()),
                 Err(_) if self.base.stream.is_none() => {
                     // write_from_buf set stream = None → network error, retry

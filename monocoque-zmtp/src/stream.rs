@@ -58,6 +58,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use smallvec::SmallVec;
 use tracing::{debug, trace, warn};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,7 +69,7 @@ use tracing::{debug, trace, warn};
 type RoutingId = Bytes;
 
 /// Messages flowing from peer-reader tasks to the application.
-type InboundMsg = Vec<Bytes>; // [routing_id, empty, data]
+type InboundMsg = SmallVec<[Bytes; 3]>; // [routing_id, empty, data]
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Background tasks
@@ -89,7 +90,7 @@ async fn peer_reader(
 
     // Connection notification
     let _ = inbound
-        .send_async(vec![routing_id.clone(), Bytes::new(), Bytes::new()])
+        .send_async(SmallVec::from_buf([routing_id.clone(), Bytes::new(), Bytes::new()]))
         .await;
 
     let mut arena = IoArena::new();
@@ -105,7 +106,10 @@ async fn peer_reader(
                 debug_assert!(n <= 8192);
                 let data = slab.freeze();
                 trace!("[STREAM] Received {} bytes from peer {:?}", n, routing_id);
-                let msg = vec![routing_id.clone(), Bytes::new(), data];
+                let mut msg = SmallVec::<[Bytes; 3]>::new();
+                msg.push(routing_id.clone());
+                msg.push(Bytes::new());
+                msg.push(data);
                 if inbound.send_async(msg).await.is_err() {
                     break; // socket dropped
                 }
@@ -118,7 +122,7 @@ async fn peer_reader(
     }
 
     // Disconnect notification
-    let _ = inbound.try_send(vec![routing_id, Bytes::new(), Bytes::new()]);
+    let _ = inbound.try_send(SmallVec::from_buf([routing_id, Bytes::new(), Bytes::new()]));
 }
 
 /// Writes raw bytes from the per-peer send channel to the TCP connection.
@@ -236,11 +240,11 @@ impl StreamSocket {
     /// # Errors
     ///
     /// Returns an error if the underlying channel has an unexpected failure.
-    pub async fn recv(&mut self) -> io::Result<Option<InboundMsg>> {
+    pub async fn recv(&mut self) -> io::Result<Option<Vec<Bytes>>> {
         match self.inbound_rx.recv_async().await {
             Ok(msg) => {
                 trace!("[STREAM] Dequeued message from peer {:?}", msg[0]);
-                Ok(Some(msg))
+                Ok(Some(msg.into_vec()))
             }
             Err(_) => Ok(None),
         }

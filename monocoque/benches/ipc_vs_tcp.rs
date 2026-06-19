@@ -70,7 +70,7 @@ fn monocoque_tcp_latency(c: &mut Criterion) {
                                 .unwrap();
 
                                 loop {
-                                    if let Some(msg) = rep.recv().await {
+                                    if let Ok(Some(msg)) = rep.recv().await {
                                         if rep.send(msg).await.is_err() {
                                             break;
                                         }
@@ -153,7 +153,7 @@ fn monocoque_ipc_latency(c: &mut Criterion) {
                                     .unwrap();
 
                                     loop {
-                                        if let Some(msg) = rep.recv().await {
+                                        if let Ok(Some(msg)) = rep.recv().await {
                                             if rep.send(msg).await.is_err() {
                                                 break;
                                             }
@@ -228,7 +228,7 @@ fn monocoque_tcp_throughput(c: &mut Criterion) {
                         .unwrap();
 
                         for _ in 0..MESSAGE_COUNT {
-                            if let Some(msg) = router.recv().await {
+                            if let Ok(Some(msg)) = router.recv().await {
                                 router.send(msg).await.ok();
                             }
                         }
@@ -295,7 +295,7 @@ fn monocoque_ipc_throughput(c: &mut Criterion) {
                                 .unwrap();
 
                                 for _ in 0..MESSAGE_COUNT {
-                                    if let Some(msg) = router.recv().await {
+                                    if let Ok(Some(msg)) = router.recv().await {
                                         router.send(msg).await.ok();
                                     }
                                 }

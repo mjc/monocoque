@@ -243,7 +243,9 @@ impl ZmtpFrame {
 /// Encode a multipart message directly into a buffer.
 ///
 /// This is a zero-allocation helper for encoding messages without
-/// creating intermediate `ZmtpFrame` objects.
+/// creating intermediate `ZmtpFrame` objects. The payloads are copied into
+/// the provided contiguous wire buffer; fanout happens later by sharing the
+/// encoded `Bytes`.
 ///
 /// # Performance
 ///
@@ -296,4 +298,23 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
 
         buf.extend_from_slice(part);
     }
+}
+
+pub(crate) fn encode_subscription_event_frame(cmd: u8, prefix: &[u8], buf: &mut BytesMut) {
+    let payload_len = 1 + prefix.len();
+    let is_long = payload_len >= 256;
+
+    buf.reserve(if is_long { 9 } else { 2 } + payload_len);
+
+    let flags = if is_long { 0x02 } else { 0x00 };
+    buf.extend_from_slice(&[flags]);
+
+    if is_long {
+        buf.extend_from_slice(&(payload_len as u64).to_be_bytes());
+    } else {
+        buf.extend_from_slice(&[payload_len as u8]);
+    }
+
+    buf.extend_from_slice(&[cmd]);
+    buf.extend_from_slice(prefix);
 }

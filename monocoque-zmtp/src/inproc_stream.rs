@@ -11,9 +11,9 @@ use std::io;
 
 /// Stream adapter for inproc transport.
 ///
-/// Implements AsyncRead + AsyncWrite using flume channels for zero-copy
-/// in-process communication. Messages are sent as complete frames without
-/// requiring serialization.
+/// Implements AsyncRead + AsyncWrite using flume channels for in-process
+/// communication. The channel layer is Bytes-based, but the stream adapter
+/// copies when it bridges into byte-oriented read/write buffers.
 pub struct InprocStream {
     /// Sender for outgoing messages
     tx: InprocSender,

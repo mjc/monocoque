@@ -187,15 +187,14 @@ impl ZapRequest {
 
     /// Encode request as multipart message
     pub fn encode(&self) -> Vec<Bytes> {
-        let mut frames = vec![
-            Bytes::from(self.version.clone()),
-            Bytes::from(self.request_id.clone()),
-            Bytes::from(self.domain.clone()),
-            Bytes::from(self.address.clone()),
-            self.identity.clone(),
-            Bytes::from(self.mechanism.as_str()),
-        ];
-        frames.extend(self.credentials.clone());
+        let mut frames = Vec::with_capacity(6 + self.credentials.len());
+        frames.push(Bytes::from_static(ZAP_VERSION.as_bytes()));
+        frames.push(Bytes::copy_from_slice(self.request_id.as_bytes()));
+        frames.push(Bytes::copy_from_slice(self.domain.as_bytes()));
+        frames.push(Bytes::copy_from_slice(self.address.as_bytes()));
+        frames.push(self.identity.clone());
+        frames.push(Bytes::from_static(self.mechanism.as_str().as_bytes()));
+        frames.extend(self.credentials.iter().cloned());
         frames
     }
 
@@ -205,19 +204,26 @@ impl ZapRequest {
             return Err("ZAP request requires at least 6 frames".to_string());
         }
 
-        let version =
-            String::from_utf8(frames[0].to_vec()).map_err(|_| "Invalid version string")?;
-        let request_id = String::from_utf8(frames[1].to_vec()).map_err(|_| "Invalid request ID")?;
-        let domain = String::from_utf8(frames[2].to_vec()).map_err(|_| "Invalid domain string")?;
-        let address =
-            String::from_utf8(frames[3].to_vec()).map_err(|_| "Invalid address string")?;
+        let version = std::str::from_utf8(frames[0].as_ref())
+            .map_err(|_| "Invalid version string")?
+            .to_owned();
+        let request_id = std::str::from_utf8(frames[1].as_ref())
+            .map_err(|_| "Invalid request ID")?
+            .to_owned();
+        let domain = std::str::from_utf8(frames[2].as_ref())
+            .map_err(|_| "Invalid domain string")?
+            .to_owned();
+        let address = std::str::from_utf8(frames[3].as_ref())
+            .map_err(|_| "Invalid address string")?
+            .to_owned();
         let identity = frames[4].clone();
 
-        let mechanism_str =
-            String::from_utf8(frames[5].to_vec()).map_err(|_| "Invalid mechanism string")?;
+        let mechanism_str = std::str::from_utf8(frames[5].as_ref())
+            .map_err(|_| "Invalid mechanism string")?;
         let mechanism = ZapMechanism::from_str(&mechanism_str).ok_or("Unknown mechanism")?;
 
-        let credentials = frames[6..].to_vec();
+        let mut credentials = Vec::with_capacity(frames.len().saturating_sub(6));
+        credentials.extend_from_slice(&frames[6..]);
 
         Ok(Self {
             version,
@@ -302,14 +308,14 @@ impl ZapResponse {
             Bytes::from(buf)
         };
 
-        vec![
-            Bytes::from(self.version.clone()),
-            Bytes::from(self.request_id.clone()),
-            Bytes::from(self.status_code.as_str()),
-            Bytes::from(self.status_text.clone()),
-            Bytes::from(self.user_id.clone()),
-            metadata_bytes,
-        ]
+        let mut frames = Vec::with_capacity(6);
+        frames.push(Bytes::from_static(ZAP_VERSION.as_bytes()));
+        frames.push(Bytes::copy_from_slice(self.request_id.as_bytes()));
+        frames.push(Bytes::from_static(self.status_code.as_str().as_bytes()));
+        frames.push(Bytes::copy_from_slice(self.status_text.as_bytes()));
+        frames.push(Bytes::copy_from_slice(self.user_id.as_bytes()));
+        frames.push(metadata_bytes);
+        frames
     }
 
     /// Decode multipart message into response
@@ -321,17 +327,23 @@ impl ZapResponse {
             ));
         }
 
-        let version =
-            String::from_utf8(frames[0].to_vec()).map_err(|_| "Invalid version string")?;
-        let request_id = String::from_utf8(frames[1].to_vec()).map_err(|_| "Invalid request ID")?;
+        let version = std::str::from_utf8(frames[0].as_ref())
+            .map_err(|_| "Invalid version string")?
+            .to_owned();
+        let request_id = std::str::from_utf8(frames[1].as_ref())
+            .map_err(|_| "Invalid request ID")?
+            .to_owned();
 
-        let status_str =
-            String::from_utf8(frames[2].to_vec()).map_err(|_| "Invalid status code")?;
-        let status_code = ZapStatus::from_str(&status_str).ok_or("Unknown status code")?;
+        let status_str = std::str::from_utf8(frames[2].as_ref())
+            .map_err(|_| "Invalid status code")?;
+        let status_code = ZapStatus::from_str(status_str).ok_or("Unknown status code")?;
 
-        let status_text =
-            String::from_utf8(frames[3].to_vec()).map_err(|_| "Invalid status text")?;
-        let user_id = String::from_utf8(frames[4].to_vec()).map_err(|_| "Invalid user ID")?;
+        let status_text = std::str::from_utf8(frames[3].as_ref())
+            .map_err(|_| "Invalid status text")?
+            .to_owned();
+        let user_id = std::str::from_utf8(frames[4].as_ref())
+            .map_err(|_| "Invalid user ID")?
+            .to_owned();
 
         // Parse metadata (RFC 35 format)
         let metadata = Self::parse_metadata(&frames[5])?;
@@ -365,8 +377,9 @@ impl ZapResponse {
             if cursor + key_len > data.len() {
                 return Err("Invalid metadata: key out of bounds".to_string());
             }
-            let key = String::from_utf8(data[cursor..cursor + key_len].to_vec())
-                .map_err(|_| "Invalid metadata key")?;
+            let key = std::str::from_utf8(&data[cursor..cursor + key_len])
+                .map_err(|_| "Invalid metadata key")?
+                .to_owned();
             cursor += key_len;
 
             // Read value length (4 bytes, big-endian)
@@ -385,8 +398,9 @@ impl ZapResponse {
             if cursor + value_len > data.len() {
                 return Err("Invalid metadata: value out of bounds".to_string());
             }
-            let value = String::from_utf8(data[cursor..cursor + value_len].to_vec())
-                .map_err(|_| "Invalid metadata value")?;
+            let value = std::str::from_utf8(&data[cursor..cursor + value_len])
+                .map_err(|_| "Invalid metadata value")?
+                .to_owned();
             cursor += value_len;
 
             metadata.insert(key, value);

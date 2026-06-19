@@ -112,6 +112,37 @@ impl<S> ReqSocket<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    async fn send_frames(&mut self, msg: &[Bytes], request_id: Option<u32>) -> io::Result<()> {
+        let frames_to_send;
+
+        if self.base.options.req_correlate {
+            let request_id = match request_id {
+                Some(id) => {
+                    self.expected_request_id = Some(id);
+                    id
+                }
+                None => {
+                    self.request_id = self.request_id.wrapping_add(1);
+                    self.expected_request_id = Some(self.request_id);
+                    self.request_id
+                }
+            };
+
+            let mut correlated_msg = Vec::with_capacity(msg.len() + 1);
+            correlated_msg.push(Bytes::copy_from_slice(&request_id.to_be_bytes()));
+            correlated_msg.extend(msg.iter().cloned());
+            frames_to_send = Some(correlated_msg);
+        } else {
+            frames_to_send = None;
+        }
+
+        self.base.write_buf.clear();
+        encode_multipart(frames_to_send.as_deref().unwrap_or(msg), &mut self.base.write_buf);
+        self.base.write_from_buf().await?;
+        self.state = ReqState::AwaitingReply;
+        Ok(())
+    }
+
     /// Create a new REQ socket from a stream using default options.
     ///
     /// This performs the ZMTP handshake and initializes the socket.
@@ -216,35 +247,7 @@ where
 
         trace!("[REQ] Sending {} frames", msg.len());
 
-        // If correlation is enabled, prepend request ID as an envelope
-        let frames_to_send = if self.base.options.req_correlate {
-            // Increment request ID
-            self.request_id = self.request_id.wrapping_add(1);
-            self.expected_request_id = Some(self.request_id);
-
-            trace!(
-                "[REQ] Correlation enabled, prepending request ID: {}",
-                self.request_id
-            );
-
-            // Prepend request ID as first frame (4 bytes, big-endian)
-            let mut correlated_msg = Vec::with_capacity(msg.len() + 1);
-            correlated_msg.push(Bytes::copy_from_slice(&self.request_id.to_be_bytes()));
-            correlated_msg.extend(msg);
-            correlated_msg
-        } else {
-            msg
-        };
-
-        // Encode message into write_buf
-        self.base.write_buf.clear();
-        encode_multipart(&frames_to_send, &mut self.base.write_buf);
-
-        // Delegate to base for writing
-        self.base.write_from_buf().await?;
-
-        // Transition to awaiting reply (unless already there in relaxed mode)
-        self.state = ReqState::AwaitingReply;
+        self.send_frames(&msg, None).await?;
 
         trace!("[REQ] Message sent successfully");
         Ok(())
@@ -670,6 +673,12 @@ impl ReqSocket<TcpStream> {
     pub async fn send_with_reconnect(&mut self, msg: Vec<Bytes>) -> io::Result<()> {
         let max = self.base.options.max_reconnect_attempts;
         let mut attempts = 0u32;
+        let request_id = if self.base.options.req_correlate {
+            self.request_id = self.request_id.wrapping_add(1);
+            Some(self.request_id)
+        } else {
+            None
+        };
 
         loop {
             if self.base.stream.is_none() {
@@ -687,17 +696,15 @@ impl ReqSocket<TcpStream> {
                     attempts
                 );
                 self.state = ReqState::Idle;
-                self.expected_request_id = None;
                 self.try_reconnect().await?;
             }
 
-            match self.send(msg.clone()).await {
+            match self.send_frames(&msg, request_id).await {
                 Ok(()) => return Ok(()),
                 Err(_) if self.base.stream.is_none() => {
                     // write_from_buf set stream = None → network error, retry
                     debug!("[REQ] Send failed (stream lost), will reconnect");
                     self.state = ReqState::Idle;
-                    self.expected_request_id = None;
                 }
                 Err(e) => return Err(e),
             }

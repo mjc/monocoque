@@ -80,7 +80,7 @@ fn monocoque_multithreaded_dealers(c: &mut Criterion) {
                                         while received_count.load(Ordering::Relaxed)
                                             < expected_total
                                         {
-                                            if let Some(msg) = router.recv().await {
+                                            if let Ok(Some(msg)) = router.recv().await {
                                                 received_count.fetch_add(1, Ordering::Relaxed);
                                                 router.send(msg).await.ok();
                                             } else {
@@ -200,7 +200,7 @@ fn monocoque_multithreaded_independent_pairs(c: &mut Criterion) {
                                     .unwrap();
 
                                     for _ in 0..MESSAGES_PER_THREAD {
-                                        if let Some(msg) = router.recv().await {
+                                        if let Ok(Some(msg)) = router.recv().await {
                                             router.send(msg).await.ok();
                                         }
                                     }
@@ -299,7 +299,7 @@ fn monocoque_core_efficiency(c: &mut Criterion) {
                                     .unwrap();
 
                                     for _ in 0..MESSAGES_PER_THREAD {
-                                        if let Some(msg) = router.recv().await {
+                                        if let Ok(Some(msg)) = router.recv().await {
                                             router.send(msg).await.ok();
                                         }
                                     }

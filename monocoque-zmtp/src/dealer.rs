@@ -39,6 +39,12 @@ impl<S> DealerSocket<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    async fn send_frames(&mut self, msg: &[Bytes]) -> io::Result<()> {
+        self.base.write_buf.clear();
+        encode_multipart(msg, &mut self.base.write_buf);
+        self.base.write_from_buf().await
+    }
+
     /// Create a new DEALER socket from a stream with default options.
     ///
     /// Uses default buffer sizes (8KB) optimized for balanced workloads.
@@ -179,12 +185,7 @@ where
     pub async fn send(&mut self, msg: Vec<Bytes>) -> io::Result<()> {
         trace!("[DEALER] Sending {} frames", msg.len());
 
-        // Encode message into write_buf
-        self.base.write_buf.clear();
-        encode_multipart(&msg, &mut self.base.write_buf);
-
-        // Delegate to base for writing from write_buf
-        self.base.write_from_buf().await?;
+        self.send_frames(&msg).await?;
 
         trace!("[DEALER] Message sent successfully");
         Ok(())
@@ -791,7 +792,7 @@ impl DealerSocket<TcpStream> {
                 self.try_reconnect().await?;
             }
 
-            match self.send(msg.clone()).await {
+            match self.send_frames(&msg).await {
                 Ok(()) => return Ok(()),
                 Err(_) if self.base.stream.is_none() => {
                     // write_from_buf set stream = None → network error, retry

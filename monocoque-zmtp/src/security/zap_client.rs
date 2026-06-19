@@ -157,8 +157,8 @@ impl ZapClient {
             Bytes::new(),
             ZapMechanism::Plain,
             vec![
-                Bytes::from(username.as_bytes().to_vec()),
-                Bytes::from(password.as_bytes().to_vec()),
+                Bytes::copy_from_slice(username.as_bytes()),
+                Bytes::copy_from_slice(password.as_bytes()),
             ],
         );
 
@@ -188,7 +188,7 @@ impl ZapClient {
             address,
             Bytes::new(),
             ZapMechanism::Curve,
-            vec![Bytes::from(client_key.to_vec())],
+            vec![Bytes::copy_from_slice(client_key)],
         );
 
         self.authenticate(&request).await
@@ -245,20 +245,29 @@ mod tests {
             ZapMechanism::Null,
             vec![],
         );
-        assert_ne!(r1.request_id, r2.request_id, "each request must have a unique ID");
+        assert_ne!(
+            r1.request_id, r2.request_id,
+            "each request must have a unique ID"
+        );
     }
 
     /// Verify the default-deny sentinel response that is returned when the ZAP
     /// endpoint is unreachable (no handler registered).
     #[test]
     fn test_denial_response_is_failure() {
-        let resp = ZapClient::denial_response("42", "No ZAP handler registered  -  connection denied by default");
+        let resp = ZapClient::denial_response(
+            "42",
+            "No ZAP handler registered  -  connection denied by default",
+        );
         assert_eq!(
             resp.status_code,
             ZapStatus::Failure,
             "missing ZAP handler must produce a Failure (400) response"
         );
-        assert!(resp.user_id.is_empty(), "denied response must have empty user_id");
+        assert!(
+            resp.user_id.is_empty(),
+            "denied response must have empty user_id"
+        );
         assert_eq!(resp.request_id, "42");
     }
 }

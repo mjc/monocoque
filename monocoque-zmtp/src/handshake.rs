@@ -96,7 +96,8 @@ where
     // Step 1: Send our greeting
     debug!("[HANDSHAKE] Step 1: Sending greeting...");
     let greeting_bytes = build_greeting_with_mechanism(mechanism, options);
-    let BufResult(write_res, _) = write_all_with_timeout(stream, greeting_bytes.clone(), timeout)
+    let greeting_len = greeting_bytes.len();
+    let BufResult(write_res, _) = write_all_with_timeout(stream, greeting_bytes, timeout)
         .await
         .map_err(|e| {
             warn!("[HANDSHAKE] Step 1: Failed to send ZMTP greeting: {}", e);
@@ -111,7 +112,7 @@ where
     })?;
     debug!(
         "[HANDSHAKE] Step 1 DONE: Sent greeting ({} bytes)",
-        greeting_bytes.len()
+        greeting_len
     );
 
     // Step 2: Receive peer greeting
@@ -158,7 +159,8 @@ where
     debug!("[HANDSHAKE] Step 4: Sending READY command...");
     let ready_body = build_ready(local_socket_type.as_str(), identity);
     let ready_frame = encode_frame(FLAG_COMMAND, &ready_body);
-    let BufResult(write_res, _) = write_all_with_timeout(stream, ready_frame.clone(), timeout)
+    let ready_len = ready_frame.len();
+    let BufResult(write_res, _) = write_all_with_timeout(stream, ready_frame, timeout)
         .await
         .map_err(|e| {
             warn!(
@@ -176,7 +178,7 @@ where
     })?;
     debug!(
         "[HANDSHAKE] Step 4 DONE: Sent READY command ({} bytes)",
-        ready_frame.len()
+        ready_len
     );
 
     // Step 5: Receive peer READY command
@@ -250,7 +252,7 @@ where
         );
         return Err(ZmtpError::Protocol);
     }
-    let body_buf = vec![0u8; body_len];
+    let body_buf = BytesMut::zeroed(body_len);
     let BufResult(read_res, body_buf) = read_exact_with_timeout(stream, body_buf, timeout)
         .await
         .map_err(|e| {
@@ -270,7 +272,7 @@ where
     debug!("[HANDSHAKE] Step 5c DONE: Read {} bytes of body", body_len);
 
     // Parse READY command
-    let ready_bytes = Bytes::from(body_buf);
+    let ready_bytes = body_buf.freeze();
     let (peer_socket_type, peer_identity) = parse_ready_command(&ready_bytes)?;
 
     debug!(

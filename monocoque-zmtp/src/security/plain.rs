@@ -178,12 +178,12 @@ where
     hello.extend_from_slice(password_bytes);
 
     // Send HELLO
-    let buf_result = write_all_with_timeout(stream, hello.freeze().to_vec(), timeout).await?;
+    let buf_result = write_all_with_timeout(stream, hello.freeze(), timeout).await?;
     let BufResult(result, _) = buf_result;
     result?;
 
     // Receive WELCOME or ERROR
-    let response = vec![0u8; 64]; // Max command size
+    let response = [0u8; 64]; // Max command size
     let BufResult(result, response) = stream.read(response).await;
     let n = result?;
 
@@ -222,7 +222,7 @@ where
     );
 
     // Read command header (6 bytes: \x05HELLO)
-    let header = vec![0u8; 6];
+    let header = [0u8; 6];
     let buf_result = read_exact_with_timeout(stream, header, timeout).await?;
     let BufResult(result, header) = buf_result;
     result?;
@@ -233,31 +233,33 @@ where
     }
 
     // Read username length
-    let len_buf = vec![0u8; 1];
+    let len_buf = [0u8; 1];
     let buf_result = read_exact_with_timeout(stream, len_buf, timeout).await?;
     let BufResult(result, len_buf) = buf_result;
     result?;
     let username_len = len_buf[0] as usize;
 
     // Read username
-    let username_buf = vec![0u8; username_len];
+    let username_buf = vec![0u8; 255];
     let buf_result = read_exact_with_timeout(stream, username_buf, timeout).await?;
-    let BufResult(result, username_buf) = buf_result;
+    let BufResult(result, mut username_buf) = buf_result;
     result?;
+    username_buf.truncate(username_len);
     let username = String::from_utf8(username_buf).map_err(|_| ZmtpError::Protocol)?;
 
     // Read password length
-    let len_buf = vec![0u8; 1];
+    let len_buf = [0u8; 1];
     let buf_result = read_exact_with_timeout(stream, len_buf, timeout).await?;
     let BufResult(result, len_buf) = buf_result;
     result?;
     let password_len = len_buf[0] as usize;
 
     // Read password
-    let password_buf = vec![0u8; password_len];
+    let password_buf = vec![0u8; 255];
     let buf_result = read_exact_with_timeout(stream, password_buf, timeout).await?;
-    let BufResult(result, password_buf) = buf_result;
+    let BufResult(result, mut password_buf) = buf_result;
     result?;
+    password_buf.truncate(password_len);
     let password = String::from_utf8(password_buf).map_err(|_| ZmtpError::Protocol)?;
 
     debug!("[PLAIN SERVER] Received credentials for user: {}", username);
@@ -275,7 +277,7 @@ where
 
             // Send WELCOME
             let buf_result =
-                write_all_with_timeout(stream, PLAIN_WELCOME.to_vec(), timeout).await?;
+                write_all_with_timeout(stream, Bytes::from_static(PLAIN_WELCOME), timeout).await?;
             let BufResult(result, _) = buf_result;
             result?;
 
@@ -285,7 +287,8 @@ where
             warn!("[PLAIN SERVER] Authentication failed: {}", reason);
 
             // Send ERROR
-            let buf_result = write_all_with_timeout(stream, PLAIN_ERROR.to_vec(), timeout).await?;
+            let buf_result =
+                write_all_with_timeout(stream, Bytes::from_static(PLAIN_ERROR), timeout).await?;
             let BufResult(result, _) = buf_result;
             result?;
 
@@ -317,7 +320,7 @@ where
     );
 
     // Read command header (6 bytes: \x05HELLO)
-    let header = vec![0u8; 6];
+    let header = [0u8; 6];
     let buf_result = read_exact_with_timeout(stream, header, timeout).await?;
     let BufResult(result, header) = buf_result;
     result?;
@@ -328,31 +331,33 @@ where
     }
 
     // Read username length
-    let len_buf = vec![0u8; 1];
+    let len_buf = [0u8; 1];
     let buf_result = read_exact_with_timeout(stream, len_buf, timeout).await?;
     let BufResult(result, len_buf) = buf_result;
     result?;
     let username_len = len_buf[0] as usize;
 
     // Read username
-    let username_buf = vec![0u8; username_len];
+    let username_buf = vec![0u8; 255];
     let buf_result = read_exact_with_timeout(stream, username_buf, timeout).await?;
-    let BufResult(result, username_buf) = buf_result;
+    let BufResult(result, mut username_buf) = buf_result;
     result?;
+    username_buf.truncate(username_len);
     let username = String::from_utf8(username_buf).map_err(|_| ZmtpError::Protocol)?;
 
     // Read password length
-    let len_buf = vec![0u8; 1];
+    let len_buf = [0u8; 1];
     let buf_result = read_exact_with_timeout(stream, len_buf, timeout).await?;
     let BufResult(result, len_buf) = buf_result;
     result?;
     let password_len = len_buf[0] as usize;
 
     // Read password
-    let password_buf = vec![0u8; password_len];
+    let password_buf = vec![0u8; 255];
     let buf_result = read_exact_with_timeout(stream, password_buf, timeout).await?;
-    let BufResult(result, password_buf) = buf_result;
+    let BufResult(result, mut password_buf) = buf_result;
     result?;
+    password_buf.truncate(password_len);
     let password = String::from_utf8(password_buf).map_err(|_| ZmtpError::Protocol)?;
 
     debug!(
@@ -382,7 +387,8 @@ where
         );
 
         // Send WELCOME
-        let buf_result = write_all_with_timeout(stream, PLAIN_WELCOME.to_vec(), timeout).await?;
+        let buf_result =
+            write_all_with_timeout(stream, Bytes::from_static(PLAIN_WELCOME), timeout).await?;
         let BufResult(result, _) = buf_result;
         result?;
 
@@ -394,7 +400,8 @@ where
         );
 
         // Send ERROR
-        let buf_result = write_all_with_timeout(stream, PLAIN_ERROR.to_vec(), timeout).await?;
+        let buf_result =
+            write_all_with_timeout(stream, Bytes::from_static(PLAIN_ERROR), timeout).await?;
         let BufResult(result, _) = buf_result;
         result?;
 

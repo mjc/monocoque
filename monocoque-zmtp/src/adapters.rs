@@ -116,6 +116,9 @@ pub trait SendSocket {
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 
     /// Send a message through the socket
+    ///
+    /// If this returns [`Poll::Pending`], the socket must retain ownership of
+    /// `msg` and complete the send on a later `poll_flush` call.
     fn poll_send(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -143,14 +146,10 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if let Some(msg) = self.pending.take() {
-            match Pin::new(&mut self.socket).poll_send(cx, msg.clone()) {
+            match Pin::new(&mut self.socket).poll_send(cx, msg) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    // Put the message back and return pending
-                    self.pending = Some(msg);
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
 
@@ -224,13 +223,10 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if let Some(msg) = self.pending.take() {
-            match Pin::new(&mut self.socket).poll_send(cx, msg.clone()) {
+            match Pin::new(&mut self.socket).poll_send(cx, msg) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    self.pending = Some(msg);
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
 
@@ -245,6 +241,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    struct MockSendSocket {
+        send_calls: Cell<usize>,
+        flush_calls: Cell<usize>,
+        pending_once: Cell<bool>,
+    }
+
+    impl MockSendSocket {
+        fn new() -> Self {
+            Self {
+                send_calls: Cell::new(0),
+                flush_calls: Cell::new(0),
+                pending_once: Cell::new(true),
+            }
+        }
+    }
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    impl SendSocket for MockSendSocket {
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_send(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _msg: Vec<Bytes>,
+        ) -> Poll<io::Result<()>> {
+            self.send_calls.set(self.send_calls.get() + 1);
+            if self.pending_once.replace(false) {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flush_calls.set(self.flush_calls.get() + 1);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn test_stream_creation() {
@@ -268,5 +319,24 @@ mod tests {
         let socket = MockSocket;
         let adapter = SocketStreamSink::new(socket);
         let _socket = adapter.into_inner();
+    }
+
+    #[test]
+    fn test_sink_flush_does_not_resend_pending_message() {
+        let socket = MockSendSocket::new();
+        let mut sink = SocketSink::new(socket);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut sink).start_send(vec![Bytes::from_static(b"hello")]),
+            Ok(())
+        ));
+        assert!(matches!(Pin::new(&mut sink).poll_flush(&mut cx), Poll::Pending));
+        assert!(matches!(Pin::new(&mut sink).poll_flush(&mut cx), Poll::Ready(Ok(()))));
+
+        let socket = sink.into_inner();
+        assert_eq!(socket.send_calls.get(), 1);
+        assert_eq!(socket.flush_calls.get(), 1);
     }
 }

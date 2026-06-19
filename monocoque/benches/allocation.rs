@@ -10,6 +10,7 @@ use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion
 use monocoque_core::buffer::SegmentedBuffer;
 use monocoque_core::message_builder::Message;
 use monocoque_core::subscription::SubscriptionEvent;
+use monocoque_zmtp::security::zap::{ZapMechanism, ZapRequest, ZapResponse};
 
 fn subscription_event_from_bytes(msg: Bytes) -> Option<SubscriptionEvent> {
     if msg.is_empty() {
@@ -55,7 +56,77 @@ fn greeting_padding_new(mechanism_name: &[u8]) -> Bytes {
     b.freeze()
 }
 
+#[inline(never)]
+fn encode_multipart_local(msg: &[Bytes], buf: &mut BytesMut) {
+    if msg.is_empty() {
+        return;
+    }
+
+    if msg.len() == 1 {
+        let part = &msg[0];
+        let is_long = part.len() >= 256;
+        let flags = if is_long { 0x02 } else { 0x00 };
+
+        buf.reserve(if is_long { 9 } else { 2 } + part.len());
+        buf.extend_from_slice(&[flags]);
+
+        if is_long {
+            buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        } else {
+            buf.extend_from_slice(&[part.len() as u8]);
+        }
+
+        buf.extend_from_slice(part);
+        return;
+    }
+
+    for (i, part) in msg.iter().enumerate() {
+        let more = i < msg.len() - 1;
+        let is_long = part.len() >= 256;
+
+        let mut flags = 0u8;
+        if more {
+            flags |= 0x01;
+        }
+        if is_long {
+            flags |= 0x02;
+        }
+
+        buf.reserve(if is_long { 9 } else { 2 } + part.len());
+        buf.extend_from_slice(&[flags]);
+
+        if is_long {
+            buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        } else {
+            buf.extend_from_slice(&[part.len() as u8]);
+        }
+
+        buf.extend_from_slice(part);
+    }
+}
+
+#[inline(never)]
+fn encode_subscription_event_local(cmd: u8, prefix: &[u8], buf: &mut BytesMut) {
+    let payload_len = 1 + prefix.len();
+    let is_long = payload_len >= 256;
+
+    buf.reserve(if is_long { 9 } else { 2 } + payload_len);
+
+    let flags = if is_long { 0x02 } else { 0x00 };
+    buf.extend_from_slice(&[flags]);
+
+    if is_long {
+        buf.extend_from_slice(&(payload_len as u64).to_be_bytes());
+    } else {
+        buf.extend_from_slice(&[payload_len as u8]);
+    }
+
+    buf.extend_from_slice(&[cmd]);
+    buf.extend_from_slice(prefix);
+}
+
 /// Bytes::copy_from_slice vs Bytes::from (moves ownership)
+#[allow(dead_code)]
 fn bench_bytes_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("bytes_construction");
 
@@ -100,6 +171,7 @@ fn bench_bytes_construction(c: &mut Criterion) {
 }
 
 /// BytesMut reuse vs fresh allocation
+#[allow(dead_code)]
 fn bench_bytesmut_reuse(c: &mut Criterion) {
     let mut group = c.benchmark_group("bytesmut_reuse");
 
@@ -159,6 +231,7 @@ fn bench_segmented_buffer(c: &mut Criterion) {
 }
 
 /// Multipart message Vec allocation patterns
+#[allow(dead_code)]
 fn bench_multipart_alloc(c: &mut Criterion) {
     let mut group = c.benchmark_group("multipart_alloc");
     let frame = Bytes::from(vec![0u8; 256]);
@@ -251,6 +324,14 @@ fn bench_protocol_alloc_fixes(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("subscription_event_wire_encode", |b| {
+        b.iter(|| {
+            let mut wire = BytesMut::new();
+            encode_subscription_event_local(0x01, b"topic.foo", &mut wire);
+            black_box(wire.freeze());
+        });
+    });
+
     group.bench_function("req_correlate_tail_clone", |b| {
         b.iter(|| {
             let cloned = req_tail[1..].to_vec();
@@ -298,6 +379,96 @@ fn bench_protocol_alloc_fixes(c: &mut Criterion) {
     group.finish();
 }
 
+/// ZAP request and response encode/decode hot paths.
+fn bench_zap_alloc_fixes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("zap_alloc_fixes");
+
+    let request_plain = ZapRequest::new(
+        "42",
+        "domain",
+        "127.0.0.1:5555",
+        Bytes::copy_from_slice(b"identity"),
+        ZapMechanism::Plain,
+        vec![
+            Bytes::copy_from_slice(b"user"),
+            Bytes::copy_from_slice(b"password"),
+        ],
+    );
+    let request_curve = ZapRequest::new(
+        "43",
+        "domain",
+        "127.0.0.1:5555",
+        Bytes::copy_from_slice(b"identity"),
+        ZapMechanism::Curve,
+        vec![Bytes::copy_from_slice(b"01234567890123456789012345678901")],
+    );
+    let response_ok = ZapResponse::success("42", "user");
+    let response_fail = ZapResponse::failure("43", "denied");
+
+    let request_plain_frames = request_plain.encode();
+    let request_curve_frames = request_curve.encode();
+    let response_ok_frames = response_ok.encode();
+    let response_fail_frames = response_fail.encode();
+
+    group.bench_function("zap_request_encode_plain", |b| {
+        b.iter(|| {
+            let frames = black_box(&request_plain).encode();
+            black_box(frames);
+        });
+    });
+
+    group.bench_function("zap_request_encode_curve", |b| {
+        b.iter(|| {
+            let frames = black_box(&request_curve).encode();
+            black_box(frames);
+        });
+    });
+
+    group.bench_function("zap_request_decode_plain", |b| {
+        b.iter(|| {
+            let decoded = ZapRequest::decode(black_box(&request_plain_frames));
+            let _ = black_box(decoded);
+        });
+    });
+
+    group.bench_function("zap_request_decode_curve", |b| {
+        b.iter(|| {
+            let decoded = ZapRequest::decode(black_box(&request_curve_frames));
+            let _ = black_box(decoded);
+        });
+    });
+
+    group.bench_function("zap_response_encode_ok", |b| {
+        b.iter(|| {
+            let frames = black_box(&response_ok).encode();
+            black_box(frames);
+        });
+    });
+
+    group.bench_function("zap_response_encode_fail", |b| {
+        b.iter(|| {
+            let frames = black_box(&response_fail).encode();
+            black_box(frames);
+        });
+    });
+
+    group.bench_function("zap_response_decode_ok", |b| {
+        b.iter(|| {
+            let decoded = ZapResponse::decode(black_box(&response_ok_frames));
+            let _ = black_box(decoded);
+        });
+    });
+
+    group.bench_function("zap_response_decode_fail", |b| {
+        b.iter(|| {
+            let decoded = ZapResponse::decode(black_box(&response_fail_frames));
+            let _ = black_box(decoded);
+        });
+    });
+
+    group.finish();
+}
+
 /// Inproc stream adapter copy path: read/write bridge between Bytes and byte buffers.
 fn bench_inproc_stream_adapter(c: &mut Criterion) {
     let mut group = c.benchmark_group("inproc_stream_adapter");
@@ -327,6 +498,7 @@ fn bench_inproc_stream_adapter(c: &mut Criterion) {
 }
 
 /// Builder/control path copies for the convenience message APIs.
+#[allow(dead_code)]
 fn bench_builder_control_allocs(c: &mut Criterion) {
     let mut group = c.benchmark_group("builder_control_allocs");
 
@@ -500,7 +672,11 @@ fn bench_regression_validations(c: &mut Criterion) {
         ("single_1kb", &[1024usize][..]),
         ("multi_3", &[32usize, 256, 1024][..]),
     ] {
-        let msg: Vec<Bytes> = parts.iter().copied().map(|len| Bytes::from(vec![0u8; len])).collect();
+        let msg: Vec<Bytes> = parts
+            .iter()
+            .copied()
+            .map(|len| Bytes::from(vec![0u8; len]))
+            .collect();
         let fresh_name = format!("encode_multipart_fresh_{label}");
         let prealloc_name = format!("encode_multipart_prealloc_{label}");
         let reuse_name = format!("encode_multipart_reuse_{label}");
@@ -529,6 +705,37 @@ fn bench_regression_validations(c: &mut Criterion) {
                 black_box(&buf);
             });
         });
+
+        if label == "single_1kb" {
+            let local_fresh_name = format!("encode_multipart_local_fresh_{label}");
+            let local_prealloc_name = format!("encode_multipart_local_prealloc_{label}");
+            let local_reuse_name = format!("encode_multipart_local_reuse_{label}");
+
+            group.bench_function(local_fresh_name.as_str(), |b| {
+                b.iter(|| {
+                    let mut buf = BytesMut::new();
+                    encode_multipart_local(black_box(&msg), &mut buf);
+                    black_box(buf);
+                });
+            });
+
+            group.bench_function(local_prealloc_name.as_str(), |b| {
+                b.iter(|| {
+                    let mut buf = BytesMut::with_capacity(msg.iter().map(|p| p.len() + 9).sum());
+                    encode_multipart_local(black_box(&msg), &mut buf);
+                    black_box(buf);
+                });
+            });
+
+            group.bench_function(local_reuse_name.as_str(), |b| {
+                let mut buf = BytesMut::with_capacity(msg.iter().map(|p| p.len() + 9).sum());
+                b.iter(|| {
+                    buf.clear();
+                    encode_multipart_local(black_box(&msg), &mut buf);
+                    black_box(&buf);
+                });
+            });
+        }
     }
 
     group.finish();
@@ -536,13 +743,10 @@ fn bench_regression_validations(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_bytes_construction,
-    bench_bytesmut_reuse,
     bench_segmented_buffer,
-    bench_multipart_alloc,
     bench_protocol_alloc_fixes,
+    bench_zap_alloc_fixes,
     bench_inproc_stream_adapter,
-    bench_builder_control_allocs,
     bench_fragmented_and_encode,
     bench_regression_validations,
 );

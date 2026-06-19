@@ -381,7 +381,11 @@ mod tests {
     impl ZapHandler for IpDenyListHandler {
         async fn authenticate(&self, request: &ZapRequest) -> ZapResponse {
             // Reject if the peer address starts with any denied IP prefix
-            if self.denied_ips.iter().any(|ip| request.address.starts_with(ip.as_str())) {
+            if self
+                .denied_ips
+                .iter()
+                .any(|ip| request.address.starts_with(ip.as_str()))
+            {
                 return ZapResponse::failure(
                     request.request_id.clone(),
                     format!("Address {} is blocked", request.address),

@@ -309,7 +309,7 @@ impl CurveClient {
         // Signature (64 bytes, zeros for now - simplified)
         hello.extend_from_slice(&[0u8; 64]);
 
-        let buf_result = write_all_with_timeout(stream, hello.freeze().to_vec(), timeout)
+        let buf_result = write_all_with_timeout(stream, hello.freeze(), timeout)
             .await
             .map_err(ZmtpError::from)?;
         let BufResult(result, _) = buf_result;
@@ -331,7 +331,7 @@ impl CurveClient {
         debug!("[CURVE CLIENT] Waiting for WELCOME");
 
         // Read WELCOME header (7 bytes)
-        let header = vec![0u8; 7];
+        let header = [0u8; 7];
         let buf_result = read_exact_with_timeout(stream, header, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -344,19 +344,16 @@ impl CurveClient {
         }
 
         // Read server short-term public key (32 bytes)
-        let server_short_key = vec![0u8; CURVE_KEY_SIZE];
+        let server_short_key = [0u8; CURVE_KEY_SIZE];
         let buf_result = read_exact_with_timeout(stream, server_short_key, timeout)
             .await
             .map_err(ZmtpError::from)?;
         let BufResult(result, server_short_key) = buf_result;
         result?;
-
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&server_short_key);
-        self.server_short_public = Some(CurvePublicKey::from_bytes(key_array));
+        self.server_short_public = Some(CurvePublicKey::from_bytes(server_short_key));
 
         // Read encrypted cookie (96 bytes)
-        let cookie = vec![0u8; 96];
+        let cookie = [0u8; 96];
         let buf_result = read_exact_with_timeout(stream, cookie, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -395,7 +392,7 @@ impl CurveClient {
         // Encrypted vouch (128 bytes)
         initiate.extend_from_slice(&[0u8; 128]);
 
-        let buf_result = write_all_with_timeout(stream, initiate.freeze().to_vec(), timeout)
+        let buf_result = write_all_with_timeout(stream, initiate.freeze(), timeout)
             .await
             .map_err(ZmtpError::from)?;
         let BufResult(result, _) = buf_result;
@@ -417,7 +414,7 @@ impl CurveClient {
         debug!("[CURVE CLIENT] Waiting for READY");
 
         // Read READY header (5 bytes)
-        let header = vec![0u8; 5];
+        let header = [0u8; 5];
         let buf_result = read_exact_with_timeout(stream, header, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -558,7 +555,7 @@ impl CurveServer {
         debug!("[CURVE SERVER] Waiting for HELLO");
 
         // Read HELLO header (5 bytes)
-        let header = vec![0u8; 5];
+        let header = [0u8; 5];
         let buf_result = read_exact_with_timeout(stream, header, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -571,7 +568,7 @@ impl CurveServer {
         }
 
         // Read version (1 byte)
-        let version = vec![0u8; 1];
+        let version = [0u8; 1];
         let buf_result = read_exact_with_timeout(stream, version, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -579,19 +576,16 @@ impl CurveServer {
         result?;
 
         // Read client short-term public key (32 bytes)
-        let client_short_key = vec![0u8; CURVE_KEY_SIZE];
+        let client_short_key = [0u8; CURVE_KEY_SIZE];
         let buf_result = read_exact_with_timeout(stream, client_short_key, timeout)
             .await
             .map_err(ZmtpError::from)?;
         let BufResult(result, client_short_key) = buf_result;
         result?;
-
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&client_short_key);
-        self.client_short_public = Some(CurvePublicKey::from_bytes(key_array));
+        self.client_short_public = Some(CurvePublicKey::from_bytes(client_short_key));
 
         // Skip nonce and signature (72 bytes)
-        let skip_buf = vec![0u8; 72];
+        let skip_buf = [0u8; 72];
         let buf_result = read_exact_with_timeout(stream, skip_buf, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -625,7 +619,7 @@ impl CurveServer {
         // Encrypted cookie (96 bytes, zeros for now - simplified)
         welcome.extend_from_slice(&[0u8; 96]);
 
-        let buf_result = write_all_with_timeout(stream, welcome.freeze().to_vec(), timeout)
+        let buf_result = write_all_with_timeout(stream, welcome.freeze(), timeout)
             .await
             .map_err(ZmtpError::from)?;
         let BufResult(result, _) = buf_result;
@@ -647,7 +641,7 @@ impl CurveServer {
         debug!("[CURVE SERVER] Waiting for INITIATE");
 
         // Read INITIATE header (8 bytes)
-        let header = vec![0u8; 8];
+        let header = [0u8; 8];
         let buf_result = read_exact_with_timeout(stream, header, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -660,19 +654,16 @@ impl CurveServer {
         }
 
         // Read client long-term public key (32 bytes)
-        let client_key = vec![0u8; CURVE_KEY_SIZE];
+        let client_key = [0u8; CURVE_KEY_SIZE];
         let buf_result = read_exact_with_timeout(stream, client_key, timeout)
             .await
             .map_err(ZmtpError::from)?;
         let BufResult(result, client_key) = buf_result;
         result?;
-
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&client_key);
-        self.client_public = Some(CurvePublicKey::from_bytes(key_array));
+        self.client_public = Some(CurvePublicKey::from_bytes(client_key));
 
         // Skip nonce and vouch (136 bytes)
-        let skip_buf = vec![0u8; 136];
+        let skip_buf = [0u8; 136];
         let buf_result = read_exact_with_timeout(stream, skip_buf, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -697,8 +688,7 @@ impl CurveServer {
 
         debug!("[CURVE SERVER] Sending READY");
 
-        let ready = Bytes::from_static(CURVE_READY).to_vec();
-        let buf_result = write_all_with_timeout(stream, ready, timeout)
+        let buf_result = write_all_with_timeout(stream, Bytes::from_static(CURVE_READY), timeout)
             .await
             .map_err(ZmtpError::from)?;
         let BufResult(result, _) = buf_result;
