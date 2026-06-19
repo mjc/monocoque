@@ -284,17 +284,23 @@ impl XPubSocket {
                                         event
                                     );
 
-                                    match &event {
+                                    match event {
                                         SubscriptionEvent::Subscribe(prefix) => {
-                                            sub.subscriptions.subscribe(prefix.clone());
+                                            if self.options.xpub_verbose {
+                                                self.pending_events.push(
+                                                    SubscriptionEvent::Subscribe(prefix.clone()),
+                                                );
+                                            }
+                                            sub.subscriptions.subscribe(prefix);
                                         }
                                         SubscriptionEvent::Unsubscribe(prefix) => {
-                                            sub.subscriptions.unsubscribe(prefix);
+                                            if self.options.xpub_verbose {
+                                                self.pending_events.push(
+                                                    SubscriptionEvent::Unsubscribe(prefix.clone()),
+                                                );
+                                            }
+                                            sub.subscriptions.unsubscribe(&prefix);
                                         }
-                                    }
-
-                                    if self.options.xpub_verbose {
-                                        self.pending_events.push(event);
                                     }
                                 }
                             }
