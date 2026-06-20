@@ -119,7 +119,13 @@ impl SegmentedBuffer {
 
         if front.len() >= n {
             self.len -= n;
-            let out = front.split_to(n);
+            if front.len() == n {
+                let out = self.segs.pop_front();
+                return out;
+            }
+
+            let out = front.slice(..n);
+            front.advance(n);
             if front.is_empty() {
                 self.segs.pop_front();
             }
@@ -146,5 +152,49 @@ impl SegmentedBuffer {
         }
 
         Some(out.freeze())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_bytes_slices_single_segment_without_losing_remainder() {
+        let mut buf = SegmentedBuffer::new();
+        buf.push(Bytes::from_static(b"abcdef"));
+
+        let out = buf.take_bytes(2).unwrap();
+        assert_eq!(&out[..], b"ab");
+        assert_eq!(buf.len(), 4);
+
+        let rest = buf.take_bytes(4).unwrap();
+        assert_eq!(&rest[..], b"cdef");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_bytes_removes_exact_single_segment() {
+        let mut buf = SegmentedBuffer::new();
+        buf.push(Bytes::from_static(b"abc"));
+
+        let out = buf.take_bytes(3).unwrap();
+        assert_eq!(&out[..], b"abc");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_bytes_copies_across_segments_and_preserves_tail() {
+        let mut buf = SegmentedBuffer::new();
+        buf.push(Bytes::from_static(b"abc"));
+        buf.push(Bytes::from_static(b"def"));
+
+        let out = buf.take_bytes(4).unwrap();
+        assert_eq!(&out[..], b"abcd");
+        assert_eq!(buf.len(), 2);
+
+        let tail = buf.take_bytes(2).unwrap();
+        assert_eq!(&tail[..], b"ef");
+        assert!(buf.is_empty());
     }
 }
