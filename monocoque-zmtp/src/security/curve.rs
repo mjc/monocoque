@@ -63,9 +63,27 @@ const CURVE_HELLO: &[u8] = b"\x05HELLO";
 const CURVE_WELCOME: &[u8] = b"\x07WELCOME";
 const CURVE_INITIATE: &[u8] = b"\x08INITIATE";
 const CURVE_READY: &[u8] = b"\x05READY";
-const CURVE_READY_PROOF: &[u8] = b"\x01";
 const CURVE_MESSAGE: &[u8] = b"\x07MESSAGE";
 const CURVE_MESSAGE_NONCE_SIZE: usize = 8;
+const CURVE_HELLO_NONCE_PREFIX: &[u8; 16] = b"CurveZMQHELLO---";
+const CURVE_WELCOME_NONCE_PREFIX: &[u8; 8] = b"WELCOME-";
+const CURVE_COOKIE_NONCE_PREFIX: &[u8; 8] = b"COOKIE--";
+const CURVE_INITIATE_NONCE_PREFIX: &[u8; 16] = b"CurveZMQINITIATE";
+const CURVE_VOUCH_NONCE_PREFIX: &[u8; 8] = b"VOUCH---";
+const CURVE_READY_NONCE_PREFIX: &[u8; 16] = b"CurveZMQREADY---";
+
+fn random_nonce<const N: usize>(prefix: &[u8]) -> ([u8; N], [u8; CURVE_NONCE_SIZE]) {
+    assert_eq!(prefix.len() + N, CURVE_NONCE_SIZE);
+
+    let mut suffix = [0u8; N];
+    rand::thread_rng().fill_bytes(&mut suffix);
+
+    let mut nonce = [0u8; CURVE_NONCE_SIZE];
+    nonce[..prefix.len()].copy_from_slice(prefix);
+    nonce[prefix.len()..].copy_from_slice(&suffix);
+
+    (suffix, nonce)
+}
 
 /// CURVE key sizes
 pub const CURVE_KEY_SIZE: usize = 32;
@@ -244,7 +262,11 @@ struct CurveHello {
 }
 
 impl CurveHello {
-    async fn read_from<S>(stream: &mut S, timeout: Option<Duration>) -> Result<Self, ZmtpError>
+    async fn read_from<S>(
+        stream: &mut S,
+        timeout: Option<Duration>,
+        server_keypair: &CurveKeyPair,
+    ) -> Result<Self, ZmtpError>
     where
         S: AsyncRead + Unpin,
     {
@@ -263,31 +285,51 @@ impl CurveHello {
         if body[0..2] != [1, 0] {
             return Err(ZmtpError::Protocol);
         }
-
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&body[74..106]);
-        if key_array == [0u8; CURVE_KEY_SIZE] {
+        if !body[2..74].iter().all(|&byte| byte == 0) {
             return Err(ZmtpError::Protocol);
         }
-        if body[114..194].iter().all(|&byte| byte == 0) {
+
+        let mut client_short_public = [0u8; CURVE_KEY_SIZE];
+        client_short_public.copy_from_slice(&body[74..106]);
+        if client_short_public == [0u8; CURVE_KEY_SIZE] {
+            return Err(ZmtpError::Protocol);
+        }
+
+        let mut short_nonce = [0u8; 8];
+        short_nonce.copy_from_slice(&body[106..114]);
+        let mut nonce = [0u8; CURVE_NONCE_SIZE];
+        nonce[..CURVE_HELLO_NONCE_PREFIX.len()].copy_from_slice(CURVE_HELLO_NONCE_PREFIX);
+        nonce[CURVE_HELLO_NONCE_PREFIX.len()..].copy_from_slice(&short_nonce);
+
+        let shared_secret = server_keypair
+            .secret
+            .diffie_hellman(&CurvePublicKey::from_bytes(client_short_public))
+            .map_err(|_| ZmtpError::Protocol)?;
+        let proof = CurveBox::new(&shared_secret)
+            .decrypt(&body[114..194], &nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        if proof.len() != 64 || !proof.iter().all(|&byte| byte == 0) {
             return Err(ZmtpError::Protocol);
         }
 
         Ok(Self {
-            client_short_public: CurvePublicKey::from_bytes(key_array),
+            client_short_public: CurvePublicKey::from_bytes(client_short_public),
         })
     }
 }
 
 struct CurveWelcome {
     server_short_public: CurvePublicKey,
+    cookie: [u8; 96],
 }
 
 impl CurveWelcome {
     async fn read_from<S>(
         stream: &mut S,
         timeout: Option<Duration>,
-        expected_server_public: &CurvePublicKey,
+        client_short_keypair: &CurveKeyPair,
+        server_public: &CurvePublicKey,
     ) -> Result<Self, ZmtpError>
     where
         S: AsyncRead + Unpin,
@@ -297,31 +339,50 @@ impl CurveWelcome {
 
         read_command_prefix(stream, CURVE_WELCOME, timeout).await?;
 
-        let server_short_key = vec![0u8; CURVE_KEY_SIZE];
-        let buf_result = read_exact_with_timeout(stream, server_short_key, timeout)
+        let welcome_nonce = vec![0u8; 16];
+        let buf_result = read_exact_with_timeout(stream, welcome_nonce, timeout)
             .await
             .map_err(ZmtpError::from)?;
-        let BufResult(result, server_short_key) = buf_result;
+        let BufResult(result, welcome_nonce) = buf_result;
         result?;
 
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&server_short_key);
-        if key_array == [0u8; CURVE_KEY_SIZE] {
+        let welcome_box = vec![0u8; 144];
+        let buf_result = read_exact_with_timeout(stream, welcome_box, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, welcome_box) = buf_result;
+        result?;
+
+        let shared_secret = client_short_keypair
+            .secret
+            .diffie_hellman(server_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        let mut nonce = [0u8; CURVE_NONCE_SIZE];
+        nonce[..CURVE_WELCOME_NONCE_PREFIX.len()].copy_from_slice(CURVE_WELCOME_NONCE_PREFIX);
+        nonce[CURVE_WELCOME_NONCE_PREFIX.len()..].copy_from_slice(&welcome_nonce);
+
+        let plaintext = CurveBox::new(&shared_secret)
+            .decrypt(&welcome_box, &nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        if plaintext.len() != CURVE_KEY_SIZE + 96 {
             return Err(ZmtpError::Protocol);
         }
 
-        let cookie = vec![0u8; 96];
-        let buf_result = read_exact_with_timeout(stream, cookie, timeout)
-            .await
-            .map_err(ZmtpError::from)?;
-        let BufResult(result, cookie) = buf_result;
-        result?;
-        if &cookie[..CURVE_KEY_SIZE] != expected_server_public.as_bytes() {
+        let mut server_short_public = [0u8; CURVE_KEY_SIZE];
+        server_short_public.copy_from_slice(&plaintext[..CURVE_KEY_SIZE]);
+
+        let mut cookie = [0u8; 96];
+        cookie.copy_from_slice(&plaintext[CURVE_KEY_SIZE..]);
+
+        if server_short_public == [0u8; CURVE_KEY_SIZE] {
             return Err(ZmtpError::Protocol);
         }
 
         Ok(Self {
-            server_short_public: CurvePublicKey::from_bytes(key_array),
+            server_short_public: CurvePublicKey::from_bytes(server_short_public),
+            cookie,
         })
     }
 }
@@ -331,7 +392,14 @@ struct CurveInitiate {
 }
 
 impl CurveInitiate {
-    async fn read_from<S>(stream: &mut S, timeout: Option<Duration>) -> Result<Self, ZmtpError>
+    async fn read_from<S>(
+        stream: &mut S,
+        timeout: Option<Duration>,
+        server_keypair: &CurveKeyPair,
+        server_short_keypair: &CurveKeyPair,
+        client_short_public: &CurvePublicKey,
+        cookie_key: &[u8; CURVE_KEY_SIZE],
+    ) -> Result<Self, ZmtpError>
     where
         S: AsyncRead + Unpin,
     {
@@ -340,35 +408,161 @@ impl CurveInitiate {
 
         read_command_prefix(stream, CURVE_INITIATE, timeout).await?;
 
-        let body = vec![0u8; 248];
-        let buf_result = read_exact_with_timeout(stream, body, timeout)
+        let cookie = vec![0u8; 96];
+        let buf_result = read_exact_with_timeout(stream, cookie, timeout)
             .await
             .map_err(ZmtpError::from)?;
-        let BufResult(result, body) = buf_result;
+        let BufResult(result, cookie) = buf_result;
         result?;
-        if body[0..96].iter().all(|&byte| byte == 0) || body[104..248].iter().all(|&byte| byte == 0)
+
+        let initiate_nonce = vec![0u8; 8];
+        let buf_result = read_exact_with_timeout(stream, initiate_nonce, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, initiate_nonce) = buf_result;
+        result?;
+
+        let initiate_box = vec![0u8; 144];
+        let buf_result = read_exact_with_timeout(stream, initiate_box, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, initiate_box) = buf_result;
+        result?;
+
+        let initiate_shared = server_short_keypair
+            .secret
+            .diffie_hellman(client_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        let mut initiate_nonce_full = [0u8; CURVE_NONCE_SIZE];
+        initiate_nonce_full[..CURVE_INITIATE_NONCE_PREFIX.len()]
+            .copy_from_slice(CURVE_INITIATE_NONCE_PREFIX);
+        initiate_nonce_full[CURVE_INITIATE_NONCE_PREFIX.len()..].copy_from_slice(&initiate_nonce);
+
+        let initiate_plaintext = CurveBox::new(&initiate_shared)
+            .decrypt(&initiate_box, &initiate_nonce_full)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        if initiate_plaintext.len() < CURVE_KEY_SIZE + 96 {
+            return Err(ZmtpError::Protocol);
+        }
+
+        let mut client_public_bytes = [0u8; CURVE_KEY_SIZE];
+        client_public_bytes.copy_from_slice(&initiate_plaintext[..CURVE_KEY_SIZE]);
+        let client_public = CurvePublicKey::from_bytes(client_public_bytes);
+
+        let vouch_bytes = &initiate_plaintext[CURVE_KEY_SIZE..CURVE_KEY_SIZE + 96];
+        let mut vouch_nonce = [0u8; 16];
+        vouch_nonce.copy_from_slice(&vouch_bytes[..16]);
+        let mut vouch_nonce_full = [0u8; CURVE_NONCE_SIZE];
+        vouch_nonce_full[..CURVE_VOUCH_NONCE_PREFIX.len()]
+            .copy_from_slice(CURVE_VOUCH_NONCE_PREFIX);
+        vouch_nonce_full[CURVE_VOUCH_NONCE_PREFIX.len()..].copy_from_slice(&vouch_nonce);
+
+        let vouch_shared = server_short_keypair
+            .secret
+            .diffie_hellman(&client_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+        let vouch_plaintext = CurveBox::new(&vouch_shared)
+            .decrypt(&vouch_bytes[16..], &vouch_nonce_full)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        if vouch_plaintext.len() != CURVE_KEY_SIZE * 2 {
+            return Err(ZmtpError::Protocol);
+        }
+
+        let mut vouch_client_short = [0u8; CURVE_KEY_SIZE];
+        vouch_client_short.copy_from_slice(&vouch_plaintext[..CURVE_KEY_SIZE]);
+        let mut vouch_server_public = [0u8; CURVE_KEY_SIZE];
+        vouch_server_public.copy_from_slice(&vouch_plaintext[CURVE_KEY_SIZE..]);
+
+        if vouch_client_short != *client_short_public.as_bytes()
+            || vouch_server_public != *server_keypair.public.as_bytes()
         {
             return Err(ZmtpError::Protocol);
         }
 
-        let mut key_array = [0u8; CURVE_KEY_SIZE];
-        key_array.copy_from_slice(&body[104..136]);
+        let mut cookie_nonce = [0u8; 16];
+        cookie_nonce.copy_from_slice(&cookie[..16]);
+        let mut cookie_nonce_full = [0u8; CURVE_NONCE_SIZE];
+        cookie_nonce_full[..CURVE_COOKIE_NONCE_PREFIX.len()]
+            .copy_from_slice(CURVE_COOKIE_NONCE_PREFIX);
+        cookie_nonce_full[CURVE_COOKIE_NONCE_PREFIX.len()..].copy_from_slice(&cookie_nonce);
 
-        Ok(Self {
-            client_public: CurvePublicKey::from_bytes(key_array),
-        })
+        let cookie_shared = CurveSharedSecret::from_bytes(*cookie_key);
+        let cookie_plaintext = CurveBox::new(&cookie_shared)
+            .decrypt(&cookie[16..], &cookie_nonce_full)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        if cookie_plaintext.len() != CURVE_KEY_SIZE * 2 {
+            return Err(ZmtpError::Protocol);
+        }
+
+        let mut cookie_client_short = [0u8; CURVE_KEY_SIZE];
+        cookie_client_short.copy_from_slice(&cookie_plaintext[..CURVE_KEY_SIZE]);
+        let mut cookie_server_secret = [0u8; CURVE_KEY_SIZE];
+        cookie_server_secret.copy_from_slice(&cookie_plaintext[CURVE_KEY_SIZE..]);
+
+        if cookie_client_short != *client_short_public.as_bytes() {
+            return Err(ZmtpError::Protocol);
+        }
+        if CurveSecretKey::from_bytes(cookie_server_secret).public_key()
+            != server_short_keypair.public
+        {
+            return Err(ZmtpError::Protocol);
+        }
+
+        Ok(Self { client_public })
     }
 }
 
 struct CurveReady;
 
 impl CurveReady {
-    async fn read_from<S>(stream: &mut S, timeout: Option<Duration>) -> Result<Self, ZmtpError>
+    async fn read_from<S>(
+        stream: &mut S,
+        timeout: Option<Duration>,
+        client_short_keypair: &CurveKeyPair,
+        server_short_public: &CurvePublicKey,
+    ) -> Result<Self, ZmtpError>
     where
         S: AsyncRead + Unpin,
     {
+        use compio::buf::BufResult;
+        use monocoque_core::timeout::read_exact_with_timeout;
+
         read_command_prefix(stream, CURVE_READY, timeout).await?;
-        read_command_prefix(stream, CURVE_READY_PROOF, timeout).await?;
+
+        let ready_nonce = vec![0u8; 8];
+        let buf_result = read_exact_with_timeout(stream, ready_nonce, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, ready_nonce) = buf_result;
+        result?;
+
+        let ready_box = vec![0u8; 16];
+        let buf_result = read_exact_with_timeout(stream, ready_box, timeout)
+            .await
+            .map_err(ZmtpError::from)?;
+        let BufResult(result, ready_box) = buf_result;
+        result?;
+
+        let shared_secret = client_short_keypair
+            .secret
+            .diffie_hellman(server_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        let mut nonce = [0u8; CURVE_NONCE_SIZE];
+        nonce[..CURVE_READY_NONCE_PREFIX.len()].copy_from_slice(CURVE_READY_NONCE_PREFIX);
+        nonce[CURVE_READY_NONCE_PREFIX.len()..].copy_from_slice(&ready_nonce);
+
+        let metadata = CurveBox::new(&shared_secret)
+            .decrypt(&ready_box, &nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+        if !metadata.is_empty() {
+            return Err(ZmtpError::Protocol);
+        }
+
         Ok(Self)
     }
 }
@@ -424,8 +618,12 @@ impl CurveSessionCipher {
     fn encrypt_message(&mut self, plaintext: &[u8]) -> Result<Bytes, CurveError> {
         let mut nonce = [0u8; CURVE_NONCE_SIZE];
         nonce[..16].copy_from_slice(&self.send_prefix);
-        nonce[16..].copy_from_slice(&self.send_nonce.to_be_bytes());
-        self.send_nonce += 1;
+        let counter = self.send_nonce;
+        self.send_nonce = self
+            .send_nonce
+            .checked_add(1)
+            .ok_or(CurveError::ProtocolViolation)?;
+        nonce[16..].copy_from_slice(&counter.to_be_bytes());
 
         let ciphertext = self.cipher.encrypt(plaintext, &nonce)?;
         let mut message = BytesMut::new();
@@ -440,13 +638,17 @@ impl CurveSessionCipher {
         if frame.counter < self.recv_nonce {
             return Err(CurveError::ProtocolViolation);
         }
+        let next_recv_nonce = frame
+            .counter
+            .checked_add(1)
+            .ok_or(CurveError::ProtocolViolation)?;
 
         let mut nonce = [0u8; CURVE_NONCE_SIZE];
         nonce[..16].copy_from_slice(&self.recv_prefix);
         nonce[16..].copy_from_slice(&message[CURVE_MESSAGE.len()..CURVE_MESSAGE.len() + 8]);
 
         let plaintext = self.cipher.decrypt(frame.ciphertext, &nonce)?;
-        self.recv_nonce = frame.counter.saturating_add(1);
+        self.recv_nonce = next_recv_nonce;
         Ok(Bytes::from(plaintext))
     }
 }
@@ -487,6 +689,8 @@ pub struct CurveClient {
     client_short_keypair: CurveKeyPair,
     /// Server's short-term public key (received in WELCOME)
     server_short_public: Option<CurvePublicKey>,
+    /// Server cookie received in WELCOME.
+    welcome_cookie: Option<[u8; 96]>,
     /// Message cipher (after READY)
     session_cipher: Option<CurveSessionCipher>,
 }
@@ -499,6 +703,7 @@ impl CurveClient {
             server_public,
             client_short_keypair: CurveKeyPair::generate(),
             server_short_public: None,
+            welcome_cookie: None,
             session_cipher: None,
         }
     }
@@ -539,10 +744,19 @@ impl CurveClient {
         hello.extend_from_slice(&[1, 0]);
         hello.extend_from_slice(&[0u8; 72]);
         hello.extend_from_slice(self.client_short_keypair.public.as_bytes());
-        hello.extend_from_slice(&[0u8; 8]);
-        hello.extend_from_slice(self.client_keypair.public.as_bytes());
-        hello.extend_from_slice(self.client_short_keypair.public.as_bytes());
-        hello.extend_from_slice(&[1u8; 16]);
+
+        let (short_nonce, nonce) = random_nonce::<8>(CURVE_HELLO_NONCE_PREFIX);
+        hello.extend_from_slice(&short_nonce);
+
+        let shared_secret = self
+            .client_short_keypair
+            .secret
+            .diffie_hellman(&self.server_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+        let proof = CurveBox::new(&shared_secret)
+            .encrypt(&[0u8; 64], &nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+        hello.extend_from_slice(&proof);
 
         let buf_result = write_all_with_timeout(stream, hello.freeze().to_vec(), timeout)
             .await
@@ -561,8 +775,15 @@ impl CurveClient {
         S: AsyncRead + Unpin,
     {
         debug!("[CURVE CLIENT] Waiting for WELCOME");
-        let welcome = CurveWelcome::read_from(stream, timeout, &self.server_public).await?;
+        let welcome = CurveWelcome::read_from(
+            stream,
+            timeout,
+            &self.client_short_keypair,
+            &self.server_public,
+        )
+        .await?;
         self.server_short_public = Some(welcome.server_short_public);
+        self.welcome_cookie = Some(welcome.cookie);
 
         debug!("[CURVE CLIENT] Received WELCOME");
         Ok(())
@@ -582,19 +803,42 @@ impl CurveClient {
 
         debug!("[CURVE CLIENT] Sending INITIATE");
 
+        let server_short_public = self.server_short_public.ok_or(ZmtpError::Protocol)?;
+        let cookie = self.welcome_cookie.take().ok_or(ZmtpError::Protocol)?;
+
+        let (vouch_short_nonce, vouch_nonce) = random_nonce::<16>(CURVE_VOUCH_NONCE_PREFIX);
+        let vouch_shared = self
+            .client_keypair
+            .secret
+            .diffie_hellman(&server_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+        let mut vouch_plaintext = BytesMut::new();
+        vouch_plaintext.extend_from_slice(self.client_short_keypair.public.as_bytes());
+        vouch_plaintext.extend_from_slice(self.server_public.as_bytes());
+        let vouch_box = CurveBox::new(&vouch_shared)
+            .encrypt(&vouch_plaintext, &vouch_nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        let mut initiate_plaintext = BytesMut::new();
+        initiate_plaintext.extend_from_slice(self.client_keypair.public.as_bytes());
+        initiate_plaintext.extend_from_slice(&vouch_short_nonce);
+        initiate_plaintext.extend_from_slice(&vouch_box);
+
+        let (initiate_short_nonce, initiate_nonce) = random_nonce::<8>(CURVE_INITIATE_NONCE_PREFIX);
+        let initiate_shared = self
+            .client_short_keypair
+            .secret
+            .diffie_hellman(&server_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+        let initiate_box = CurveBox::new(&initiate_shared)
+            .encrypt(&initiate_plaintext, &initiate_nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+
         let mut initiate = BytesMut::new();
         initiate.extend_from_slice(CURVE_INITIATE);
-
-        initiate.extend_from_slice(self.server_public.as_bytes());
-        initiate.extend_from_slice(self.client_short_keypair.public.as_bytes());
-        initiate.extend_from_slice(self.client_keypair.public.as_bytes());
-
-        let mut nonce = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        initiate.extend_from_slice(&nonce);
-        initiate.extend_from_slice(self.client_keypair.public.as_bytes());
-        initiate.extend_from_slice(self.client_short_keypair.public.as_bytes());
-        initiate.extend_from_slice(&[1u8; 80]);
+        initiate.extend_from_slice(&cookie);
+        initiate.extend_from_slice(&initiate_short_nonce);
+        initiate.extend_from_slice(&initiate_box);
 
         let buf_result = write_all_with_timeout(stream, initiate.freeze().to_vec(), timeout)
             .await
@@ -613,11 +857,16 @@ impl CurveClient {
         S: AsyncRead + Unpin,
     {
         debug!("[CURVE CLIENT] Waiting for READY");
-        let _ready = CurveReady::read_from(stream, timeout).await?;
+        let server_short_public = self.server_short_public.ok_or(ZmtpError::Protocol)?;
+        let _ready = CurveReady::read_from(
+            stream,
+            timeout,
+            &self.client_short_keypair,
+            &server_short_public,
+        )
+        .await?;
 
         // Compute shared secret for message encryption
-        let server_short_public = self.server_short_public.ok_or(ZmtpError::Protocol)?;
-
         let shared_secret = self
             .client_short_keypair
             .secret
@@ -659,6 +908,8 @@ pub struct CurveServer {
     server_keypair: CurveKeyPair,
     /// Server's short-term (ephemeral) key pair
     server_short_keypair: CurveKeyPair,
+    /// Cookie key used to authenticate the server's transient key pair.
+    cookie_key: Option<[u8; CURVE_KEY_SIZE]>,
     /// Client's short-term public key (received in HELLO)
     client_short_public: Option<CurvePublicKey>,
     /// Client's long-term public key (received in INITIATE)
@@ -673,6 +924,7 @@ impl CurveServer {
         Self {
             server_keypair,
             server_short_keypair: CurveKeyPair::generate(),
+            cookie_key: None,
             client_short_public: None,
             client_public: None,
             session_cipher: None,
@@ -707,7 +959,7 @@ impl CurveServer {
         S: AsyncRead + Unpin,
     {
         debug!("[CURVE SERVER] Waiting for HELLO");
-        let hello = CurveHello::read_from(stream, timeout).await?;
+        let hello = CurveHello::read_from(stream, timeout, &self.server_keypair).await?;
         self.client_short_public = Some(hello.client_short_public);
 
         debug!("[CURVE SERVER] Received HELLO");
@@ -728,15 +980,49 @@ impl CurveServer {
 
         debug!("[CURVE SERVER] Sending WELCOME");
 
+        let client_short_public = self.client_short_public.ok_or(ZmtpError::Protocol)?;
+        let (welcome_short_nonce, welcome_nonce) = random_nonce::<16>(CURVE_WELCOME_NONCE_PREFIX);
+        let (cookie_short_nonce, cookie_nonce) = random_nonce::<16>(CURVE_COOKIE_NONCE_PREFIX);
+
+        let cookie_key = {
+            let mut key = [0u8; CURVE_KEY_SIZE];
+            rand::thread_rng().fill_bytes(&mut key);
+            key
+        };
+        self.cookie_key = Some(cookie_key);
+
+        let mut cookie_plaintext = BytesMut::new();
+        cookie_plaintext.extend_from_slice(client_short_public.as_bytes());
+        let server_short_secret = self.server_short_keypair.secret.0.to_bytes();
+        cookie_plaintext.extend_from_slice(&server_short_secret);
+
+        let cookie_shared = CurveSharedSecret::from_bytes(cookie_key);
+        let cookie_box = CurveBox::new(&cookie_shared)
+            .encrypt(&cookie_plaintext, &cookie_nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        let mut cookie = BytesMut::new();
+        cookie.extend_from_slice(&cookie_short_nonce);
+        cookie.extend_from_slice(&cookie_box);
+
+        let mut welcome_plaintext = BytesMut::new();
+        welcome_plaintext.extend_from_slice(self.server_short_keypair.public.as_bytes());
+        welcome_plaintext.extend_from_slice(&cookie);
+
+        let welcome_shared = self
+            .server_keypair
+            .secret
+            .diffie_hellman(&client_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        let welcome_box = CurveBox::new(&welcome_shared)
+            .encrypt(&welcome_plaintext, &welcome_nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+
         let mut welcome = BytesMut::new();
         welcome.extend_from_slice(CURVE_WELCOME);
-
-        // Server short-term public key (32 bytes)
-        welcome.extend_from_slice(self.server_short_keypair.public.as_bytes());
-
-        let mut cookie = [0u8; 96];
-        cookie[..CURVE_KEY_SIZE].copy_from_slice(self.server_keypair.public.as_bytes());
-        welcome.extend_from_slice(&cookie);
+        welcome.extend_from_slice(&welcome_short_nonce);
+        welcome.extend_from_slice(&welcome_box);
 
         let buf_result = write_all_with_timeout(stream, welcome.freeze().to_vec(), timeout)
             .await
@@ -759,8 +1045,19 @@ impl CurveServer {
             return Err(ZmtpError::Protocol);
         }
 
-        let initiate = CurveInitiate::read_from(stream, timeout).await?;
+        let client_short_public = self.client_short_public.ok_or(ZmtpError::Protocol)?;
+        let cookie_key = self.cookie_key.ok_or(ZmtpError::Protocol)?;
+        let initiate = CurveInitiate::read_from(
+            stream,
+            timeout,
+            &self.server_keypair,
+            &self.server_short_keypair,
+            &client_short_public,
+            &cookie_key,
+        )
+        .await?;
         self.client_public = Some(initiate.client_public);
+        self.cookie_key = None;
 
         debug!("[CURVE SERVER] Received INITIATE");
         Ok(())
@@ -780,9 +1077,22 @@ impl CurveServer {
 
         debug!("[CURVE SERVER] Sending READY");
 
+        let client_short_public = self.client_short_public.ok_or(ZmtpError::Protocol)?;
+        let (ready_short_nonce, ready_nonce) = random_nonce::<8>(CURVE_READY_NONCE_PREFIX);
+        let shared_secret = self
+            .server_short_keypair
+            .secret
+            .diffie_hellman(&client_short_public)
+            .map_err(|_| ZmtpError::Protocol)?;
+
+        let ready_box = CurveBox::new(&shared_secret)
+            .encrypt(&[], &ready_nonce)
+            .map_err(|_| ZmtpError::Protocol)?;
+
         let mut ready = BytesMut::new();
         ready.extend_from_slice(CURVE_READY);
-        ready.extend_from_slice(CURVE_READY_PROOF);
+        ready.extend_from_slice(&ready_short_nonce);
+        ready.extend_from_slice(&ready_box);
         let buf_result = write_all_with_timeout(stream, ready, timeout)
             .await
             .map_err(ZmtpError::from)?;
@@ -790,14 +1100,6 @@ impl CurveServer {
         result?;
 
         // Compute shared secret for message encryption
-        let client_short_public = self.client_short_public.ok_or(ZmtpError::Protocol)?;
-
-        let shared_secret = self
-            .server_short_keypair
-            .secret
-            .diffie_hellman(&client_short_public)
-            .map_err(|_| ZmtpError::Protocol)?;
-
         self.session_cipher = Some(CurveSessionCipher::new(
             shared_secret,
             *b"CurveZMQMESSAGES",
