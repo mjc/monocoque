@@ -287,6 +287,18 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_sink_stages_multipart_message_atomically_rfc37() {
+        let mut adapter = SocketStreamSink::new(MockSocket);
+        let multipart = vec![
+            Bytes::from_static(b"frame-1"),
+            Bytes::from_static(b"frame-2"),
+        ];
+
+        assert!(Pin::new(&mut adapter).start_send(multipart.clone()).is_ok());
+        assert_eq!(adapter.pending_send.as_ref(), Some(&multipart));
+    }
+
+    #[test]
     fn test_stream_sink_rejects_overwriting_pending_message() {
         let mut adapter = SocketStreamSink::new(MockSocket);
         let first = vec![Bytes::from_static(b"first")];
