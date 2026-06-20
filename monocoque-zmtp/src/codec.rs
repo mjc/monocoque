@@ -275,6 +275,12 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
     }
 
     // Multi-frame path
+    let total_len = msg
+        .iter()
+        .map(|part| if part.len() >= 256 { 9 } else { 2 } + part.len())
+        .sum();
+    buf.reserve(total_len);
+
     for (i, part) in msg.iter().enumerate() {
         let more = i < msg.len() - 1;
         let is_long = part.len() >= 256;
@@ -287,7 +293,6 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
             flags |= 0x02; // LONG
         }
 
-        buf.reserve(if is_long { 9 } else { 2 } + part.len());
         buf.extend_from_slice(&[flags]);
 
         if is_long {
@@ -317,4 +322,43 @@ pub(crate) fn encode_subscription_event_frame(cmd: u8, prefix: &[u8], buf: &mut 
 
     buf.extend_from_slice(&[cmd]);
     buf.extend_from_slice(prefix);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_multipart_multi_frame_sets_more_and_long_headers() {
+        let msg = vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from(vec![0xCD; 256]),
+            Bytes::from_static(b"z"),
+        ];
+        let mut buf = BytesMut::new();
+
+        encode_multipart(&msg, &mut buf);
+
+        assert_eq!(buf[0], 0x01);
+        assert_eq!(buf[1], 2);
+        assert_eq!(&buf[2..4], b"ab");
+
+        assert_eq!(buf[4], 0x03);
+        assert_eq!(&buf[5..13], 256u64.to_be_bytes().as_slice());
+        assert_eq!(&buf[13..269], vec![0xCD; 256].as_slice());
+
+        assert_eq!(buf[269], 0x00);
+        assert_eq!(buf[270], 1);
+        assert_eq!(buf[271], b'z');
+        assert_eq!(buf.len(), 272);
+    }
+
+    #[test]
+    fn encode_multipart_empty_message_writes_nothing() {
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+
+        encode_multipart(&[], &mut buf);
+
+        assert_eq!(&buf[..], b"prefix");
+    }
 }
