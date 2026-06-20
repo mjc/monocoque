@@ -181,7 +181,7 @@ where
     /// Set socket options (builder-style).
     #[inline]
     pub fn set_options(&mut self, options: SocketOptions) {
-        self.base.options = options;
+        self.base.set_options(options);
     }
 
     /// Get the socket type.
@@ -558,9 +558,12 @@ mod tests {
         client.send(vec![Bytes::from_static(b"xx")]).await.unwrap();
 
         let recv_result = server_task.await;
-        assert!(
-            recv_result.is_err(),
-            "receiver accepted a frame larger than SocketOptions::max_msg_size"
+        let err = recv_result
+            .expect_err("receiver accepted a frame larger than SocketOptions::max_msg_size");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "oversized frame was rejected for the wrong reason"
         );
     }
 }

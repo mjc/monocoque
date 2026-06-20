@@ -510,9 +510,9 @@ mod tests {
                 ZapStatus::Failure,
                 "connections from denied IPs must be rejected with status 400"
             );
-            assert!(
-                denied_response.status_text.contains("192.168.1.100"),
-                "failure message should name the blocked address"
+            assert_eq!(
+                denied_response.status_text, "Address is blocked",
+                "failure message should indicate that the address was blocked"
             );
 
             // --- Another denied address ---

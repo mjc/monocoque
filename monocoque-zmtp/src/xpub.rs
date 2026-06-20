@@ -29,7 +29,7 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::handshake::perform_handshake_with_options;
 use crate::session::SocketType;
@@ -278,10 +278,13 @@ impl XPubSocket {
                                 }
                                 if let Some(max_msg_size) = self.options.max_msg_size {
                                     if frame.payload.len() > max_msg_size {
-                                        return Err(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "received message frame exceeds max_msg_size",
-                                        ));
+                                        warn!(
+                                            "[XPUB] Dropping oversized frame from subscriber {} ({} > {})",
+                                            sub.id,
+                                            frame.payload.len(),
+                                            max_msg_size
+                                        );
+                                        continue;
                                     }
                                 }
                                 if let Some(event) = SubscriptionEvent::from_message(&frame.payload)

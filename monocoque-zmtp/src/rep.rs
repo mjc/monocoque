@@ -194,7 +194,10 @@ where
                             }
                             continue;
                         }
-                        self.base.reject_oversized_frame(frame.payload.len())?;
+                        if let Err(err) = self.base.reject_oversized_frame(frame.payload.len()) {
+                            self.frames.clear();
+                            return Err(err);
+                        }
                         let more = frame.more();
                         self.frames.push(frame.payload);
 
@@ -291,7 +294,7 @@ where
 
     /// Set socket options.
     pub fn set_options(&mut self, options: SocketOptions) {
-        self.base.options = options;
+        self.base.set_options(options);
     }
 
     /// Get the current state of the REP socket.

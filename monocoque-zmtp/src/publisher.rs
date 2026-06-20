@@ -114,7 +114,7 @@ async fn subscription_reader(
     let mut recv_buf = SegmentedBuffer::new();
     let mut decoder = crate::codec::ZmtpDecoder::with_max_body_len(max_body_len);
 
-    loop {
+    'reader: loop {
         // Read a chunk from the subscriber.
         let buf = vec![0u8; 256];
         let BufResult(result, buf) = reader.read(buf).await;
@@ -161,7 +161,7 @@ async fn subscription_reader(
                                 "[PUB] Subscription reader for subscriber {} decode error: {}",
                                 id, e
                             );
-                            break;
+                            break 'reader;
                         }
                     }
                 }
