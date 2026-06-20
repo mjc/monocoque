@@ -87,17 +87,16 @@ impl SegmentedBuffer {
         self.len -= n;
 
         while n > 0 {
-            let Some(mut front) = self.segs.pop_front() else {
+            let Some(front) = self.segs.front_mut() else {
                 break;
             };
-            if n >= front.len() {
-                n -= front.len();
-                continue;
+            if n < front.len() {
+                front.advance(n);
+                break;
             }
-            // partially consumed
-            front.advance(n);
-            self.segs.push_front(front);
-            break;
+
+            n -= front.len();
+            self.segs.pop_front();
         }
     }
 
