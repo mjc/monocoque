@@ -275,11 +275,13 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
     }
 
     // Multi-frame path
-    let total_len = msg
-        .iter()
-        .map(|part| if part.len() >= 256 { 9 } else { 2 } + part.len())
-        .sum();
-    buf.reserve(total_len);
+    if buf.capacity() == 0 {
+        let total_len = msg
+            .iter()
+            .map(|part| if part.len() >= 256 { 9 } else { 2 } + part.len())
+            .sum();
+        buf.reserve(total_len);
+    }
 
     for (i, part) in msg.iter().enumerate() {
         let more = i < msg.len() - 1;
