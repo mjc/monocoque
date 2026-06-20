@@ -24,7 +24,7 @@ use bytes::Bytes;
 #[cfg(unix)]
 use compio::net::{TcpListener, UnixListener};
 #[cfg(unix)]
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 #[cfg(unix)]
 use monocoque::zmq::{DealerSocket, RepSocket, ReqSocket, RouterSocket, SocketOptions};
 #[cfg(unix)]
@@ -244,7 +244,7 @@ fn monocoque_tcp_throughput(c: &mut Criterion) {
 
                     for _ in 0..MESSAGE_COUNT {
                         dealer.send(vec![black_box(payload.clone())]).await.unwrap();
-                        if dealer.recv().await.is_none() {
+                        if !matches!(dealer.recv().await, Ok(Some(_))) {
                             break;
                         }
                     }
@@ -316,7 +316,7 @@ fn monocoque_ipc_throughput(c: &mut Criterion) {
 
                         for _ in 0..MESSAGE_COUNT {
                             dealer.send(vec![black_box(payload.clone())]).await.unwrap();
-                            if dealer.recv().await.is_none() {
+                            if !matches!(dealer.recv().await, Ok(Some(_))) {
                                 break;
                             }
                         }

@@ -3,7 +3,7 @@
 //! This provides a more efficient subscription matching mechanism than linear
 //! scanning, especially for large numbers of subscriptions.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 /// A subscription entry with topic prefix
 #[derive(Debug, Clone)]
@@ -131,13 +131,14 @@ impl SubscriptionEvent {
 
     /// Create a subscription event from an owned payload without copying the prefix.
     #[must_use]
-    pub fn from_bytes(msg: Bytes) -> Option<Self> {
+    pub fn from_bytes(mut msg: Bytes) -> Option<Self> {
         if msg.is_empty() {
             return None;
         }
 
-        let prefix = msg.slice(1..);
-        match msg[0] {
+        let cmd = msg[0];
+        let prefix = msg.split_off(1);
+        match cmd {
             0x01 => Some(Self::Subscribe(prefix)),
             0x00 => Some(Self::Unsubscribe(prefix)),
             _ => None,
@@ -152,10 +153,10 @@ impl SubscriptionEvent {
             Self::Unsubscribe(p) => (0x00u8, p),
         };
 
-        let mut msg = BytesMut::with_capacity(1 + prefix.len());
-        msg.extend_from_slice(&[cmd]);
+        let mut msg = Vec::with_capacity(1 + prefix.len());
+        msg.push(cmd);
         msg.extend_from_slice(prefix);
-        msg.freeze()
+        Bytes::from(msg)
     }
 
     /// Get the topic prefix
