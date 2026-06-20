@@ -286,15 +286,34 @@ mod tests {
         }
     }
 
+    fn multipart_message() -> Vec<Bytes> {
+        vec![
+            Bytes::from_static(b"frame-1"),
+            Bytes::from_static(b"frame-2"),
+        ]
+    }
+
+    fn start_send(sink: &mut SocketStreamSink<MockSocket>, msg: Vec<Bytes>) -> io::Result<()> {
+        Pin::new(sink).start_send(msg)
+    }
+
+    fn poll_flush(
+        sink: &mut SocketStreamSink<MockSocket>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(sink).poll_flush(cx)
+    }
+
+    fn test_context() -> Context<'static> {
+        Context::from_waker(futures::task::noop_waker_ref())
+    }
+
     #[test]
     fn test_stream_sink_stages_multipart_message_atomically_rfc37() {
         let mut adapter = SocketStreamSink::new(MockSocket);
-        let multipart = vec![
-            Bytes::from_static(b"frame-1"),
-            Bytes::from_static(b"frame-2"),
-        ];
+        let multipart = multipart_message();
 
-        assert!(Pin::new(&mut adapter).start_send(multipart.clone()).is_ok());
+        start_send(&mut adapter, multipart.clone()).unwrap();
         assert_eq!(adapter.pending_send.as_ref(), Some(&multipart));
     }
 
@@ -304,10 +323,9 @@ mod tests {
         let first = vec![Bytes::from_static(b"first")];
         let second = vec![Bytes::from_static(b"second")];
 
-        assert!(Pin::new(&mut adapter).start_send(first.clone()).is_ok());
+        start_send(&mut adapter, first.clone()).unwrap();
 
-        let err = Pin::new(&mut adapter)
-            .start_send(second)
+        let err = start_send(&mut adapter, second)
             .expect_err("a second send before flush should be rejected");
 
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
@@ -318,12 +336,11 @@ mod tests {
     fn test_stream_sink_flush_clears_pending_message() {
         let mut adapter = SocketStreamSink::new(MockSocket);
         let message = vec![Bytes::from_static(b"payload")];
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = test_context();
 
-        assert!(Pin::new(&mut adapter).start_send(message).is_ok());
+        start_send(&mut adapter, message).unwrap();
         assert!(matches!(
-            Pin::new(&mut adapter).poll_flush(&mut cx),
+            poll_flush(&mut adapter, &mut cx),
             Poll::Ready(Ok(()))
         ));
         assert!(adapter.pending_send.is_none());

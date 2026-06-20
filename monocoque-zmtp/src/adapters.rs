@@ -264,28 +264,31 @@ where
 mod tests {
     use super::*;
     use futures::Sink;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::io;
     use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
+    use std::rc::Rc;
     use std::task::{Context, Poll};
 
-    #[derive(Clone, Default)]
+    type SendAttemptLog = Rc<RefCell<Vec<Vec<Bytes>>>>;
+
+    #[derive(Default)]
     struct RecordingSendSocket {
-        attempts: Arc<Mutex<Vec<Vec<Bytes>>>>,
-        outcomes: Arc<Mutex<VecDeque<Poll<io::Result<()>>>>>,
+        attempts: SendAttemptLog,
+        outcomes: VecDeque<Poll<io::Result<()>>>,
     }
 
     impl RecordingSendSocket {
-        fn new(outcomes: Vec<Poll<io::Result<()>>>) -> Self {
+        fn with_outcomes(outcomes: impl IntoIterator<Item = Poll<io::Result<()>>>) -> Self {
             Self {
-                attempts: Arc::new(Mutex::new(Vec::new())),
-                outcomes: Arc::new(Mutex::new(outcomes.into())),
+                attempts: SendAttemptLog::default(),
+                outcomes: outcomes.into_iter().collect(),
             }
         }
 
-        fn attempts(&self) -> Vec<Vec<Bytes>> {
-            self.attempts.lock().expect("attempt log poisoned").clone()
+        fn attempts(&self) -> SendAttemptLog {
+            Rc::clone(&self.attempts)
         }
     }
 
@@ -295,19 +298,12 @@ mod tests {
         }
 
         fn poll_send(
-            self: Pin<&mut Self>,
+            mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             msg: Vec<Bytes>,
         ) -> Poll<io::Result<()>> {
-            self.attempts
-                .lock()
-                .expect("attempt log poisoned")
-                .push(msg);
-            self.outcomes
-                .lock()
-                .expect("outcome queue poisoned")
-                .pop_front()
-                .unwrap_or(Poll::Ready(Ok(())))
+            self.attempts.borrow_mut().push(msg);
+            self.outcomes.pop_front().unwrap_or(Poll::Ready(Ok(())))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -322,9 +318,26 @@ mod tests {
         ]
     }
 
+    fn start_send(
+        sink: &mut SocketStreamSink<RecordingSendSocket>,
+        msg: Vec<Bytes>,
+    ) -> io::Result<()> {
+        Pin::new(sink).start_send(msg)
+    }
+
+    fn poll_flush(
+        sink: &mut SocketStreamSink<RecordingSendSocket>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(sink).poll_flush(cx)
+    }
+
     fn test_context() -> Context<'static> {
-        let waker = Box::leak(Box::new(futures::task::noop_waker()));
-        Context::from_waker(waker)
+        Context::from_waker(futures::task::noop_waker_ref())
+    }
+
+    fn recorded_attempts(attempts: &SendAttemptLog) -> Vec<Vec<Bytes>> {
+        attempts.borrow().clone()
     }
 
     #[test]
@@ -353,88 +366,87 @@ mod tests {
 
     #[test]
     fn test_stream_sink_preserves_rfc_atomic_multipart_message() {
-        let socket = RecordingSendSocket::new(vec![Poll::Ready(Ok(()))]);
-        let mut adapter = SocketStreamSink::new(socket.clone());
+        let socket = RecordingSendSocket::with_outcomes([Poll::Ready(Ok(()))]);
+        let attempts = socket.attempts();
+        let mut adapter = SocketStreamSink::new(socket);
         let message = multipart_message();
         let mut cx = test_context();
 
-        assert!(Pin::new(&mut adapter).start_send(message.clone()).is_ok());
+        start_send(&mut adapter, message.clone()).unwrap();
         assert!(matches!(
-            Pin::new(&mut adapter).poll_flush(&mut cx),
+            poll_flush(&mut adapter, &mut cx),
             Poll::Ready(Ok(()))
         ));
-        assert_eq!(socket.attempts(), vec![message]);
+        assert_eq!(recorded_attempts(&attempts), vec![message]);
         assert!(adapter.pending.is_none());
     }
 
     #[test]
     fn test_stream_sink_rejects_overwrite_before_flush() {
-        let socket = RecordingSendSocket::new(vec![Poll::Ready(Ok(()))]);
-        let mut adapter = SocketStreamSink::new(socket.clone());
+        let socket = RecordingSendSocket::with_outcomes([Poll::Ready(Ok(()))]);
+        let attempts = socket.attempts();
+        let mut adapter = SocketStreamSink::new(socket);
         let first = multipart_message();
         let second = vec![Bytes::from_static(b"other")];
 
-        assert!(Pin::new(&mut adapter).start_send(first.clone()).is_ok());
+        start_send(&mut adapter, first.clone()).unwrap();
 
-        let err = Pin::new(&mut adapter)
-            .start_send(second)
+        let err = start_send(&mut adapter, second)
             .expect_err("a second send before flush should be rejected");
 
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(adapter.pending.as_ref(), Some(&first));
-        assert!(socket.attempts().is_empty());
+        assert!(recorded_attempts(&attempts).is_empty());
     }
 
     #[test]
     fn test_stream_sink_keeps_pending_message_when_queue_is_full() {
-        let socket = RecordingSendSocket::new(vec![Poll::Pending, Poll::Ready(Ok(()))]);
-        let mut adapter = SocketStreamSink::new(socket.clone());
+        let socket = RecordingSendSocket::with_outcomes([Poll::Pending, Poll::Ready(Ok(()))]);
+        let attempts = socket.attempts();
+        let mut adapter = SocketStreamSink::new(socket);
         let message = multipart_message();
         let mut cx = test_context();
 
-        assert!(Pin::new(&mut adapter).start_send(message.clone()).is_ok());
-        assert!(matches!(
-            Pin::new(&mut adapter).poll_flush(&mut cx),
-            Poll::Pending
-        ));
+        start_send(&mut adapter, message.clone()).unwrap();
+        assert!(matches!(poll_flush(&mut adapter, &mut cx), Poll::Pending));
         assert_eq!(adapter.pending.as_ref(), Some(&message));
 
         assert!(matches!(
-            Pin::new(&mut adapter).poll_flush(&mut cx),
+            poll_flush(&mut adapter, &mut cx),
             Poll::Ready(Ok(()))
         ));
         assert!(adapter.pending.is_none());
-        assert_eq!(socket.attempts(), vec![message.clone(), message]);
+        assert_eq!(recorded_attempts(&attempts), vec![message.clone(), message]);
     }
 
     #[test]
     fn test_stream_sink_keeps_pending_message_when_send_errors() {
-        let error = io::Error::new(io::ErrorKind::BrokenPipe, "send failed");
-        let socket = RecordingSendSocket::new(vec![
+        let socket = RecordingSendSocket::with_outcomes([
             Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "send failed",
             ))),
             Poll::Ready(Ok(())),
         ]);
-        let mut adapter = SocketStreamSink::new(socket.clone());
+        let attempts = socket.attempts();
+        let mut adapter = SocketStreamSink::new(socket);
         let message = multipart_message();
         let mut cx = test_context();
 
-        assert!(Pin::new(&mut adapter).start_send(message.clone()).is_ok());
-        let observed = match Pin::new(&mut adapter).poll_flush(&mut cx) {
+        start_send(&mut adapter, message.clone()).unwrap();
+        let observed = match poll_flush(&mut adapter, &mut cx) {
             Poll::Ready(Err(err)) => err,
             other => panic!("expected send error, got {other:?}"),
         };
-        assert_eq!(observed.kind(), error.kind());
+        assert_eq!(observed.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(adapter.pending.as_ref(), Some(&message));
-        assert_eq!(socket.attempts(), vec![message.clone()]);
+        assert_eq!(recorded_attempts(&attempts), vec![message.clone()]);
 
         assert!(matches!(
-            Pin::new(&mut adapter).poll_flush(&mut cx),
+            poll_flush(&mut adapter, &mut cx),
             Poll::Ready(Ok(()))
         ));
         assert!(adapter.pending.is_none());
-        assert_eq!(socket.attempts(), vec![message.clone(), message]);
+        assert_eq!(recorded_attempts(&attempts), vec![message.clone(), message]);
     }
 }
