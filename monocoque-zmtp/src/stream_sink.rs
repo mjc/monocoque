@@ -235,12 +235,24 @@ impl<S: Socket + Unpin> Sink<Vec<Bytes>> for SocketStreamSink<S> {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
+        if self.pending_send.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "previous message has not been flushed yet",
+            ));
+        }
         self.pending_send = Some(item);
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Placeholder - full implementation would send pending messages
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        // Placeholder - the real implementation would write the pending
+        // message to the socket. For now, just drain the staged item so the
+        // sink can be used again without silently overwriting data.
+        self.pending_send.take();
         Poll::Ready(Ok(()))
     }
 
@@ -251,13 +263,57 @@ impl<S: Socket + Unpin> Sink<Vec<Bytes>> for SocketStreamSink<S> {
 
 #[cfg(test)]
 mod tests {
-    // Note: Full integration tests would require actual sockets
-    // These are placeholder tests for the adapter structure
+    use super::*;
+    use futures::Sink;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct MockSocket;
+
+    #[async_trait::async_trait(?Send)]
+    impl Socket for MockSocket {
+        async fn send(&mut self, _msg: Vec<Bytes>) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> io::Result<Option<Vec<Bytes>>> {
+            Ok(None)
+        }
+
+        fn socket_type(&self) -> crate::SocketType {
+            crate::SocketType::Pair
+        }
+    }
 
     #[test]
-    fn test_stream_adapter_creation() {
-        // We can't easily create a real socket in a unit test,
-        // but we can test the adapter structure
-        // Full tests should be in integration tests
+    fn test_stream_sink_rejects_overwriting_pending_message() {
+        let mut adapter = SocketStreamSink::new(MockSocket);
+        let first = vec![Bytes::from_static(b"first")];
+        let second = vec![Bytes::from_static(b"second")];
+
+        assert!(Pin::new(&mut adapter).start_send(first.clone()).is_ok());
+
+        let err = Pin::new(&mut adapter)
+            .start_send(second)
+            .expect_err("a second send before flush should be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(adapter.pending_send.as_ref(), Some(&first));
+    }
+
+    #[test]
+    fn test_stream_sink_flush_clears_pending_message() {
+        let mut adapter = SocketStreamSink::new(MockSocket);
+        let message = vec![Bytes::from_static(b"payload")];
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut adapter).start_send(message).is_ok());
+        assert!(matches!(
+            Pin::new(&mut adapter).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(adapter.pending_send.is_none());
     }
 }

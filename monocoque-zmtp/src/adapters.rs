@@ -137,6 +137,12 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
+        if self.pending.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "previous message has not been flushed yet",
+            ));
+        }
         self.pending = Some(item);
         Ok(())
     }
@@ -218,6 +224,12 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
+        if self.pending.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "previous message has not been flushed yet",
+            ));
+        }
         self.pending = Some(item);
         Ok(())
     }
