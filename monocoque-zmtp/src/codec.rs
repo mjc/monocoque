@@ -262,6 +262,7 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
         let flags = if is_long { 0x02 } else { 0x00 }; // No MORE flag
 
         buf.reserve(if is_long { 9 } else { 2 } + part.len());
+
         buf.extend_from_slice(&[flags]);
 
         if is_long {
@@ -275,7 +276,8 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
     }
 
     // Multi-frame path
-    if buf.capacity() == 0 {
+    let reserve_each_frame = buf.capacity() != 0;
+    if !reserve_each_frame {
         let total_len = msg
             .iter()
             .map(|part| if part.len() >= 256 { 9 } else { 2 } + part.len())
@@ -283,27 +285,53 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
         buf.reserve(total_len);
     }
 
-    for (i, part) in msg.iter().enumerate() {
-        let more = i < msg.len() - 1;
-        let is_long = part.len() >= 256;
+    if reserve_each_frame {
+        for (i, part) in msg.iter().enumerate() {
+            let more = i < msg.len() - 1;
+            let is_long = part.len() >= 256;
 
-        let mut flags = 0u8;
-        if more {
-            flags |= 0x01; // MORE
+            let mut flags = 0u8;
+            if more {
+                flags |= 0x01; // MORE
+            }
+            if is_long {
+                flags |= 0x02; // LONG
+            }
+
+            buf.reserve(if is_long { 9 } else { 2 } + part.len());
+            buf.extend_from_slice(&[flags]);
+
+            if is_long {
+                buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            } else {
+                buf.extend_from_slice(&[part.len() as u8]);
+            }
+
+            buf.extend_from_slice(part);
         }
-        if is_long {
-            flags |= 0x02; // LONG
+    } else {
+        for (i, part) in msg.iter().enumerate() {
+            let more = i < msg.len() - 1;
+            let is_long = part.len() >= 256;
+
+            let mut flags = 0u8;
+            if more {
+                flags |= 0x01; // MORE
+            }
+            if is_long {
+                flags |= 0x02; // LONG
+            }
+
+            buf.extend_from_slice(&[flags]);
+
+            if is_long {
+                buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            } else {
+                buf.extend_from_slice(&[part.len() as u8]);
+            }
+
+            buf.extend_from_slice(part);
         }
-
-        buf.extend_from_slice(&[flags]);
-
-        if is_long {
-            buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
-        } else {
-            buf.extend_from_slice(&[part.len() as u8]);
-        }
-
-        buf.extend_from_slice(part);
     }
 }
 
@@ -353,6 +381,24 @@ mod tests {
         assert_eq!(buf[270], 1);
         assert_eq!(buf[271], b'z');
         assert_eq!(buf.len(), 272);
+    }
+
+    #[test]
+    fn encode_multipart_multi_frame_appends_to_preallocated_buffer() {
+        let msg = vec![Bytes::from_static(b"a"), Bytes::from_static(b"bc")];
+        let mut buf = BytesMut::with_capacity(16);
+        buf.extend_from_slice(b"prefix");
+
+        encode_multipart(&msg, &mut buf);
+
+        assert_eq!(&buf[..6], b"prefix");
+        assert_eq!(buf[6], 0x01);
+        assert_eq!(buf[7], 1);
+        assert_eq!(buf[8], b'a');
+        assert_eq!(buf[9], 0x00);
+        assert_eq!(buf[10], 2);
+        assert_eq!(&buf[11..13], b"bc");
+        assert_eq!(buf.len(), 13);
     }
 
     #[test]
