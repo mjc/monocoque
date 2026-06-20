@@ -235,14 +235,15 @@ impl<S: Socket + Unpin> Sink<Vec<Bytes>> for SocketStreamSink<S> {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
-        if self.pending_send.is_some() {
-            return Err(io::Error::new(
+        if let Some(pending) = self.pending_send.replace(item) {
+            self.pending_send = Some(pending);
+            Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "previous message has not been flushed yet",
-            ));
+            ))
+        } else {
+            Ok(())
         }
-        self.pending_send = Some(item);
-        Ok(())
     }
 
     fn poll_flush(

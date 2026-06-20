@@ -137,14 +137,15 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
-        if self.pending.is_some() {
-            return Err(io::Error::new(
+        if let Some(pending) = self.pending.replace(item) {
+            self.pending = Some(pending);
+            Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "previous message has not been flushed yet",
-            ));
+            ))
+        } else {
+            Ok(())
         }
-        self.pending = Some(item);
-        Ok(())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -227,14 +228,15 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
-        if self.pending.is_some() {
-            return Err(io::Error::new(
+        if let Some(pending) = self.pending.replace(item) {
+            self.pending = Some(pending);
+            Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "previous message has not been flushed yet",
-            ));
+            ))
+        } else {
+            Ok(())
         }
-        self.pending = Some(item);
-        Ok(())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
