@@ -231,7 +231,10 @@ impl<S: Socket + Unpin> Sink<Vec<Bytes>> for SocketStreamSink<S> {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+        match &self.pending_send {
+            Some(_) => Poll::Pending,
+            None => Poll::Ready(Ok(())),
+        }
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
@@ -298,6 +301,13 @@ mod tests {
         Pin::new(sink).start_send(msg)
     }
 
+    fn poll_ready(
+        sink: &mut SocketStreamSink<MockSocket>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(sink).poll_ready(cx)
+    }
+
     fn poll_flush(
         sink: &mut SocketStreamSink<MockSocket>,
         cx: &mut Context<'_>,
@@ -319,15 +329,38 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_sink_rejects_overwriting_pending_message() {
+    fn test_stream_sink_not_ready_until_pending_message_flushes() {
+        let mut adapter = SocketStreamSink::new(MockSocket);
+        let first = vec![Bytes::from_static(b"first")];
+        let mut cx = test_context();
+
+        assert!(matches!(
+            poll_ready(&mut adapter, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        start_send(&mut adapter, first.clone()).unwrap();
+        assert!(matches!(poll_ready(&mut adapter, &mut cx), Poll::Pending));
+        assert_eq!(adapter.pending_send.as_ref(), Some(&first));
+
+        assert!(matches!(
+            poll_flush(&mut adapter, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            poll_ready(&mut adapter, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn test_stream_sink_rejects_start_send_without_readiness() {
         let mut adapter = SocketStreamSink::new(MockSocket);
         let first = vec![Bytes::from_static(b"first")];
         let second = vec![Bytes::from_static(b"second")];
 
         start_send(&mut adapter, first.clone()).unwrap();
-
         let err = start_send(&mut adapter, second)
-            .expect_err("a second send before flush should be rejected");
+            .expect_err("start_send without readiness should be rejected");
 
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(adapter.pending_send.as_ref(), Some(&first));

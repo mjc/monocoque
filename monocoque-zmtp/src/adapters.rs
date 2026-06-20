@@ -133,7 +133,10 @@ where
     type Error = io::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.socket).poll_ready(cx)
+        match &self.pending {
+            Some(_) => Poll::Pending,
+            None => Pin::new(&mut self.socket).poll_ready(cx),
+        }
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
@@ -224,7 +227,10 @@ where
     type Error = io::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.socket).poll_ready(cx)
+        match &self.pending {
+            Some(_) => Poll::Pending,
+            None => Pin::new(&mut self.socket).poll_ready(cx),
+        }
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
@@ -327,6 +333,20 @@ mod tests {
         Pin::new(sink).start_send(msg)
     }
 
+    fn poll_ready(
+        sink: &mut SocketStreamSink<RecordingSendSocket>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(sink).poll_ready(cx)
+    }
+
+    fn poll_sink_ready(
+        sink: &mut SocketSink<RecordingSendSocket>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(sink).poll_ready(cx)
+    }
+
     fn poll_flush(
         sink: &mut SocketStreamSink<RecordingSendSocket>,
         cx: &mut Context<'_>,
@@ -359,6 +379,29 @@ mod tests {
     }
 
     #[test]
+    fn test_sink_not_ready_until_pending_message_flushes() {
+        let socket = RecordingSendSocket::with_outcomes([Poll::Ready(Ok(()))]);
+        let mut sink = SocketSink::new(socket);
+        let mut cx = test_context();
+
+        assert!(matches!(
+            poll_sink_ready(&mut sink, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        Pin::new(&mut sink).start_send(multipart_message()).unwrap();
+        assert!(matches!(poll_sink_ready(&mut sink, &mut cx), Poll::Pending));
+
+        assert!(matches!(
+            Pin::new(&mut sink).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            poll_sink_ready(&mut sink, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
     fn test_stream_sink_creation() {
         struct MockSocket;
         let socket = MockSocket;
@@ -384,21 +427,44 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_sink_rejects_overwrite_before_flush() {
+    fn test_stream_sink_not_ready_until_pending_message_flushes() {
         let socket = RecordingSendSocket::with_outcomes([Poll::Ready(Ok(()))]);
         let attempts = socket.attempts();
+        let mut adapter = SocketStreamSink::new(socket);
+        let first = multipart_message();
+        let mut cx = test_context();
+
+        assert!(matches!(
+            poll_ready(&mut adapter, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        start_send(&mut adapter, first.clone()).unwrap();
+        assert!(matches!(poll_ready(&mut adapter, &mut cx), Poll::Pending));
+        assert!(recorded_attempts(&attempts).is_empty());
+
+        assert!(matches!(
+            poll_flush(&mut adapter, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            poll_ready(&mut adapter, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn test_stream_sink_rejects_start_send_without_readiness() {
+        let socket = RecordingSendSocket::with_outcomes([Poll::Ready(Ok(()))]);
         let mut adapter = SocketStreamSink::new(socket);
         let first = multipart_message();
         let second = vec![Bytes::from_static(b"other")];
 
         start_send(&mut adapter, first.clone()).unwrap();
-
         let err = start_send(&mut adapter, second)
-            .expect_err("a second send before flush should be rejected");
+            .expect_err("start_send without readiness should be rejected");
 
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(adapter.pending.as_ref(), Some(&first));
-        assert!(recorded_attempts(&attempts).is_empty());
     }
 
     #[test]
