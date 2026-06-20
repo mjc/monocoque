@@ -93,7 +93,9 @@ impl<S: Socket + Unpin> Stream for SocketStream<S> {
 
 /// Adapter that implements `Sink` for any socket implementing the `Socket` trait.
 ///
-/// This allows using ZeroMQ sockets with sink combinators like `send`, `send_all`, etc.
+/// This adapter currently stages at most one message and reports an error from
+/// `poll_flush` instead of silently dropping data. It is not yet wired to drive
+/// the async `Socket::send` future from a `Sink` poll method.
 ///
 /// # Examples
 ///
@@ -113,12 +115,16 @@ impl<S: Socket + Unpin> Stream for SocketStream<S> {
 /// ```
 pub struct SocketSink<S> {
     socket: S,
+    pending_send: Option<Vec<Bytes>>,
 }
 
 impl<S> SocketSink<S> {
     /// Create a new sink adapter for a socket.
     pub const fn new(socket: S) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            pending_send: None,
+        }
     }
 
     /// Get a reference to the underlying socket.
@@ -141,19 +147,36 @@ impl<S: Socket + Unpin> Sink<Vec<Bytes>> for SocketSink<S> {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // ZeroMQ sockets are always ready to accept sends (they buffer internally)
-        Poll::Ready(Ok(()))
+        match &self.pending_send {
+            Some(_) => Poll::Pending,
+            None => Poll::Ready(Ok(())),
+        }
     }
 
-    fn start_send(self: Pin<&mut Self>, _item: Vec<Bytes>) -> Result<(), Self::Error> {
-        // Placeholder Sink implementation - not yet fully integrated with Socket trait
-        // For a complete implementation, this would need a buffer field in the struct
-        Ok(())
+    fn start_send(mut self: Pin<&mut Self>, item: Vec<Bytes>) -> Result<(), Self::Error> {
+        match self.pending_send {
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "previous message has not been flushed yet",
+            )),
+            None => {
+                self.pending_send = Some(item);
+                Ok(())
+            }
+        }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Placeholder - full implementation would send buffered messages
-        Poll::Ready(Ok(()))
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        match &mut self.pending_send {
+            Some(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stream_sink::SocketSink cannot flush pending messages yet",
+            ))),
+            None => Poll::Ready(Ok(())),
+        }
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -166,6 +189,10 @@ impl<S: Socket + Unpin> Sink<Vec<Bytes>> for SocketSink<S> {
 ///
 /// This provides both `Stream` and `Sink` implementations for sockets that support
 /// both sending and receiving (DEALER, ROUTER, REQ, REP, PAIR).
+///
+/// The sink side currently stages at most one message and reports an error from
+/// `poll_flush` instead of silently dropping data. It is not yet wired to drive
+/// the async `Socket::send` future from a `Sink` poll method.
 ///
 /// # Examples
 ///
@@ -254,11 +281,13 @@ impl<S: Socket + Unpin> Sink<Vec<Bytes>> for SocketStreamSink<S> {
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        // Placeholder - the real implementation would write the pending
-        // message to the socket. For now, just drain the staged item so the
-        // sink can be used again without silently overwriting data.
-        self.pending_send.take();
-        Poll::Ready(Ok(()))
+        match &mut self.pending_send {
+            Some(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stream_sink::SocketStreamSink cannot flush pending messages yet",
+            ))),
+            None => Poll::Ready(Ok(())),
+        }
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -302,8 +331,19 @@ mod tests {
         Pin::new(sink).start_send(msg)
     }
 
+    fn start_sink_send(sink: &mut SocketSink<MockSocket>, msg: Vec<Bytes>) -> io::Result<()> {
+        Pin::new(sink).start_send(msg)
+    }
+
     fn poll_ready(
         sink: &mut SocketStreamSink<MockSocket>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(sink).poll_ready(cx)
+    }
+
+    fn poll_sink_ready(
+        sink: &mut SocketSink<MockSocket>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         Pin::new(sink).poll_ready(cx)
@@ -316,8 +356,60 @@ mod tests {
         Pin::new(sink).poll_flush(cx)
     }
 
+    fn poll_sink_flush(
+        sink: &mut SocketSink<MockSocket>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(sink).poll_flush(cx)
+    }
+
+    fn assert_unsupported(result: Poll<io::Result<()>>) {
+        match result {
+            Poll::Ready(Err(err)) => assert_eq!(err.kind(), io::ErrorKind::Unsupported),
+            other => panic!("expected unsupported flush error, got {other:?}"),
+        }
+    }
+
     fn test_context() -> Context<'static> {
         Context::from_waker(futures::task::noop_waker_ref())
+    }
+
+    #[test]
+    fn test_sink_stages_message_instead_of_dropping_it() {
+        let mut adapter = SocketSink::new(MockSocket);
+        let message = multipart_message();
+
+        start_sink_send(&mut adapter, message.clone()).unwrap();
+        assert_eq!(adapter.pending_send.as_ref(), Some(&message));
+    }
+
+    #[test]
+    fn test_sink_not_ready_while_message_is_pending() {
+        let mut adapter = SocketSink::new(MockSocket);
+        let message = vec![Bytes::from_static(b"payload")];
+        let mut cx = test_context();
+
+        assert!(matches!(
+            poll_sink_ready(&mut adapter, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        start_sink_send(&mut adapter, message.clone()).unwrap();
+        assert!(matches!(
+            poll_sink_ready(&mut adapter, &mut cx),
+            Poll::Pending
+        ));
+        assert_eq!(adapter.pending_send.as_ref(), Some(&message));
+    }
+
+    #[test]
+    fn test_sink_flush_fails_without_dropping_pending_message() {
+        let mut adapter = SocketSink::new(MockSocket);
+        let message = vec![Bytes::from_static(b"payload")];
+        let mut cx = test_context();
+
+        start_sink_send(&mut adapter, message.clone()).unwrap();
+        assert_unsupported(poll_sink_flush(&mut adapter, &mut cx));
+        assert_eq!(adapter.pending_send.as_ref(), Some(&message));
     }
 
     #[test]
@@ -330,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_sink_not_ready_until_pending_message_flushes() {
+    fn test_stream_sink_not_ready_while_message_is_pending() {
         let mut adapter = SocketStreamSink::new(MockSocket);
         let first = vec![Bytes::from_static(b"first")];
         let mut cx = test_context();
@@ -342,15 +434,6 @@ mod tests {
         start_send(&mut adapter, first.clone()).unwrap();
         assert!(matches!(poll_ready(&mut adapter, &mut cx), Poll::Pending));
         assert_eq!(adapter.pending_send.as_ref(), Some(&first));
-
-        assert!(matches!(
-            poll_flush(&mut adapter, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert!(matches!(
-            poll_ready(&mut adapter, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
     }
 
     #[test]
@@ -368,16 +451,13 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_sink_flush_clears_pending_message() {
+    fn test_stream_sink_flush_fails_without_dropping_pending_message() {
         let mut adapter = SocketStreamSink::new(MockSocket);
         let message = vec![Bytes::from_static(b"payload")];
         let mut cx = test_context();
 
-        start_send(&mut adapter, message).unwrap();
-        assert!(matches!(
-            poll_flush(&mut adapter, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert!(adapter.pending_send.is_none());
+        start_send(&mut adapter, message.clone()).unwrap();
+        assert_unsupported(poll_flush(&mut adapter, &mut cx));
+        assert_eq!(adapter.pending_send.as_ref(), Some(&message));
     }
 }
