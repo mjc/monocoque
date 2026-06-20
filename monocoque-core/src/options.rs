@@ -78,7 +78,7 @@ pub struct SocketOptions {
     /// - Default: 8192 (8KB) - balanced for most workloads
     /// - Small (4KB): Low-latency with small messages (< 1KB)
     /// - Large (16KB): High-throughput with large messages (> 8KB)
-    pub read_buffer_size: usize,
+    read_buffer_size: usize,
 
     /// Write buffer size (bytes)
     ///
@@ -455,7 +455,7 @@ pub struct SocketOptions {
 impl fmt::Debug for SocketOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SocketOptions")
-            .field("read_buffer_size", &self.read_buffer_size)
+            .field("read_buffer_size", &self.read_buffer_size())
             .field("write_buffer_size", &self.write_buffer_size)
             .field("recv_timeout", &self.recv_timeout)
             .field("send_timeout", &self.send_timeout)
@@ -747,6 +747,15 @@ impl SocketOptions {
         self.curve_secretkey
             .as_ref()
             .map(CurveSecretKeyBytes::as_bytes)
+    }
+
+    /// Get the configured read buffer size after applying the page-size cap.
+    pub const fn read_buffer_size(&self) -> usize {
+        if self.read_buffer_size > crate::alloc::PAGE_SIZE {
+            crate::alloc::PAGE_SIZE
+        } else {
+            self.read_buffer_size
+        }
     }
 
     /// Set receive high water mark.
@@ -1376,7 +1385,7 @@ mod tests {
         let opts = SocketOptions::new().with_read_buffer_size(crate::alloc::PAGE_SIZE + 1);
 
         assert!(
-            opts.read_buffer_size <= crate::alloc::PAGE_SIZE,
+            opts.read_buffer_size() <= crate::alloc::PAGE_SIZE,
             "SocketOptions allowed a read buffer size larger than the arena page"
         );
     }

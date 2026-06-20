@@ -226,8 +226,8 @@ where
     /// # }
     /// ```
     pub fn send_buffered(&mut self, msg: Vec<Bytes>) -> io::Result<()> {
-        // Check HWM before buffering
-        if self.base.buffered_messages >= self.base.options.send_hwm {
+        // Check HWM before buffering.
+        if self.base.hwm_reached() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!(
@@ -283,17 +283,20 @@ where
     pub async fn send_batch(&mut self, messages: &[Vec<Bytes>]) -> io::Result<()> {
         trace!("[DEALER] Batching {} messages", messages.len());
 
+        if self.base.options.send_hwm != 0
+            && self.base.buffered_messages.saturating_add(messages.len())
+                > self.base.options.send_hwm
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Send high water mark reached ({} messages)",
+                    self.base.options.send_hwm
+                ),
+            ));
+        }
+
         for msg in messages {
-            // Check HWM for each message
-            if self.base.buffered_messages >= self.base.options.send_hwm {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "Send high water mark reached ({} messages)",
-                        self.base.options.send_hwm
-                    ),
-                ));
-            }
             encode_multipart(msg, &mut self.base.send_buffer);
             self.base.buffered_messages += 1;
         }
@@ -469,7 +472,7 @@ where
     /// ```
     #[inline]
     pub fn set_options(&mut self, options: SocketOptions) {
-        self.base.options = options;
+        self.base.set_options(options);
     }
 
     /// Get the socket type.

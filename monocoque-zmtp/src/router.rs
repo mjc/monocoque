@@ -219,7 +219,7 @@ where
     /// Use this for batching multiple messages before a single flush.
     /// Call `flush()` to send all buffered messages.
     pub fn send_buffered(&mut self, msg: Vec<Bytes>) -> io::Result<()> {
-        if self.base.buffered_messages >= self.base.options.send_hwm {
+        if self.base.hwm_reached() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Send high water mark reached. Flush or drop messages.",
@@ -247,13 +247,17 @@ where
     pub async fn send_batch(&mut self, messages: &[Vec<Bytes>]) -> io::Result<()> {
         trace!("[ROUTER] Batching {} messages", messages.len());
 
+        if self.base.options.send_hwm != 0
+            && self.base.buffered_messages.saturating_add(messages.len())
+                > self.base.options.send_hwm
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Send high water mark reached",
+            ));
+        }
+
         for msg in messages {
-            if self.base.buffered_messages >= self.base.options.send_hwm {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Send high water mark reached",
-                ));
-            }
             let frames_to_send = if msg.len() > 1 { &msg[1..] } else { &msg[..] };
             encode_multipart(frames_to_send, &mut self.base.send_buffer);
             self.base.buffered_messages += 1;
@@ -337,7 +341,7 @@ where
     /// Set socket options (builder-style).
     #[inline]
     pub fn set_options(&mut self, options: SocketOptions) {
-        self.base.options = options;
+        self.base.set_options(options);
     }
 
     /// Get the socket type.
