@@ -363,6 +363,12 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_endpoint_rejects_control_characters() {
+        assert!(validate_and_extract_name("inproc://tenant\0shadow").is_err());
+        assert!(validate_and_extract_name("inproc://tenant\nshadow").is_err());
+    }
+
+    #[test]
     fn test_bind_duplicate() {
         let endpoint = "inproc://test-duplicate";
 
