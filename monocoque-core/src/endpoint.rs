@@ -156,6 +156,13 @@ mod tests {
         assert_eq!(endpoint.to_string(), "ipc:///tmp/test.sock");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_invalid_ipc_relative_path() {
+        let result = Endpoint::parse("ipc://relative.sock");
+        assert!(matches!(result, Err(EndpointError::InvalidScheme(_))));
+    }
+
     #[test]
     fn test_invalid_scheme() {
         let result = Endpoint::parse("http://127.0.0.1:5555");
