@@ -252,6 +252,15 @@ mod tests {
     }
 
     #[test]
+    fn test_trie_checks_broader_prefix_after_non_matching_candidate() {
+        let mut trie = SubscriptionTrie::new();
+        trie.subscribe(Bytes::from_static(b"a"));
+        trie.subscribe(Bytes::from_static(b"aa~"));
+
+        assert!(trie.matches(b"ab"));
+    }
+
+    #[test]
     fn test_subscription_event() {
         let sub = SubscriptionEvent::Subscribe(Bytes::from_static(b"topic"));
         let msg = sub.to_message();
