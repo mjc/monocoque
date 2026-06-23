@@ -425,6 +425,110 @@ mod tests {
     }
 
     #[test]
+    fn zap_request_decode_rejects_unsupported_version() {
+        let frames = vec![
+            Bytes::from("2.0"),
+            Bytes::from("123"),
+            Bytes::from("test"),
+            Bytes::from("127.0.0.1"),
+            Bytes::new(),
+            Bytes::from("NULL"),
+        ];
+
+        assert!(ZapRequest::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_request_decode_rejects_null_credentials() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::from("test"),
+            Bytes::from("127.0.0.1"),
+            Bytes::new(),
+            Bytes::from("NULL"),
+            Bytes::from("unexpected"),
+        ];
+
+        assert!(ZapRequest::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_request_decode_rejects_empty_domain() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::new(),
+            Bytes::from("127.0.0.1"),
+            Bytes::new(),
+            Bytes::from("NULL"),
+        ];
+
+        assert!(ZapRequest::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_request_decode_rejects_empty_address() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::from("test"),
+            Bytes::new(),
+            Bytes::new(),
+            Bytes::from("NULL"),
+        ];
+
+        assert!(ZapRequest::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_request_decode_rejects_overlong_identity() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::from("test"),
+            Bytes::from("127.0.0.1"),
+            Bytes::from(vec![0u8; 256]),
+            Bytes::from("NULL"),
+        ];
+
+        assert!(ZapRequest::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_request_decode_rejects_plain_extra_credentials() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::from("test"),
+            Bytes::from("127.0.0.1"),
+            Bytes::new(),
+            Bytes::from("PLAIN"),
+            Bytes::from("admin"),
+            Bytes::from("secret"),
+            Bytes::from("shadow"),
+        ];
+
+        assert!(ZapRequest::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_request_decode_rejects_curve_extra_credentials() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::from("test"),
+            Bytes::from("127.0.0.1"),
+            Bytes::new(),
+            Bytes::from("CURVE"),
+            Bytes::from(vec![0u8; 32]),
+            Bytes::from("shadow"),
+        ];
+
+        assert!(ZapRequest::decode(&frames).is_err());
+    }
+
+    #[test]
     fn test_zap_response_success() {
         let response = ZapResponse::success("123", "testuser");
         let frames = response.encode();
