@@ -66,3 +66,62 @@ impl ZmtpGreeting {
         std::str::from_utf8(&self.mechanism[..end]).unwrap_or("UNKNOWN")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_greeting() -> Bytes {
+        let mut greeting = [0u8; GREETING_SIZE];
+        greeting[0] = SIGNATURE_HEAD;
+        greeting[9] = SIGNATURE_TAIL;
+        greeting[10] = 3;
+        greeting[11] = 1;
+        greeting[12..16].copy_from_slice(b"NULL");
+        Bytes::copy_from_slice(&greeting)
+    }
+
+    #[test]
+    fn parse_rejects_trailing_bytes_after_fixed_greeting() {
+        let mut greeting = valid_greeting().to_vec();
+        greeting.push(0);
+
+        assert!(matches!(
+            ZmtpGreeting::parse(&Bytes::from(greeting)),
+            Err(ZmtpError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_as_server_flag() {
+        let mut greeting = valid_greeting().to_vec();
+        greeting[32] = 2;
+
+        assert!(matches!(
+            ZmtpGreeting::parse(&Bytes::from(greeting)),
+            Err(ZmtpError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_security_mechanism_characters() {
+        let mut greeting = valid_greeting().to_vec();
+        greeting[12..18].copy_from_slice(b"BAD ME");
+
+        assert!(matches!(
+            ZmtpGreeting::parse(&Bytes::from(greeting)),
+            Err(ZmtpError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_nonzero_mechanism_padding() {
+        let mut greeting = valid_greeting().to_vec();
+        greeting[17..22].copy_from_slice(b"CURVE");
+
+        assert!(matches!(
+            ZmtpGreeting::parse(&Bytes::from(greeting)),
+            Err(ZmtpError::Protocol)
+        ));
+    }
+}
