@@ -1786,4 +1786,29 @@ mod tests {
         assert_eq!(st.unwrap().as_ref(), b"ROUTER");
         assert!(id.is_none());
     }
+
+    #[test]
+    fn decode_zmtp_props_rejects_duplicate_socket_type_property() {
+        let mut encoded = Vec::new();
+        push_prop(&mut encoded, b"Socket-Type", b"DEALER");
+        push_prop(&mut encoded, b"Socket-Type", b"ROUTER");
+
+        assert!(matches!(
+            decode_zmtp_props(&encoded),
+            Err(ZmtpError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn decode_zmtp_props_rejects_duplicate_identity_property() {
+        let mut encoded = Vec::new();
+        push_prop(&mut encoded, b"Socket-Type", b"DEALER");
+        push_prop(&mut encoded, b"Identity", b"trusted");
+        push_prop(&mut encoded, b"Identity", b"shadow");
+
+        assert!(matches!(
+            decode_zmtp_props(&encoded),
+            Err(ZmtpError::Protocol)
+        ));
+    }
 }
