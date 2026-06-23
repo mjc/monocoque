@@ -1346,11 +1346,21 @@ mod tests {
     }
 
     #[test]
+    fn test_is_ping_payload_rejects_context_over_16_octets() {
+        assert!(!is_ping_payload(b"\x04PING\x00\x0A12345678901234567"));
+    }
+
+    #[test]
     fn test_is_pong_payload() {
         assert!(is_pong_payload(b"\x04PONG"));
         assert!(!is_pong_payload(b"\x04PING\x00\x0A"));
         assert!(!is_pong_payload(b"\x05READY"));
         assert!(!is_pong_payload(b""));
+    }
+
+    #[test]
+    fn test_is_pong_payload_rejects_context_over_16_octets() {
+        assert!(!is_pong_payload(b"\x04PONG12345678901234567"));
     }
 
     // ── Heartbeat state helpers ───────────────────────────────────────────────
