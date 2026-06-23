@@ -319,3 +319,20 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
         buf.extend_from_slice(part);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_sets_long_flag_for_public_large_frame_payload() {
+        let frame = ZmtpFrame {
+            flags: 0,
+            payload: Bytes::from(vec![0x42; 256]),
+        };
+
+        let encoded = frame.encode();
+
+        assert_eq!(encoded[0] & 0x02, 0x02);
+    }
+}
