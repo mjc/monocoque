@@ -596,3 +596,46 @@ fn parse_socket_type(value: &[u8]) -> Result<SocketType, ZmtpError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_body(properties: &[(&[u8], &[u8])]) -> Bytes {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"\x05READY");
+
+        for (key, value) in properties {
+            body.push(key.len() as u8);
+            body.extend_from_slice(key);
+            body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            body.extend_from_slice(value);
+        }
+
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn parse_ready_rejects_duplicate_socket_type_property() {
+        let body = ready_body(&[(b"Socket-Type", b"DEALER"), (b"Socket-Type", b"ROUTER")]);
+
+        assert!(matches!(
+            parse_ready_command(&body),
+            Err(ZmtpError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn parse_ready_rejects_duplicate_identity_property() {
+        let body = ready_body(&[
+            (b"Socket-Type", b"DEALER"),
+            (b"Identity", b"trusted"),
+            (b"Identity", b"shadow"),
+        ]);
+
+        assert!(matches!(
+            parse_ready_command(&body),
+            Err(ZmtpError::Protocol)
+        ));
+    }
+}
