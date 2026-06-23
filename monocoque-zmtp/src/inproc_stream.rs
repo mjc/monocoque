@@ -155,4 +155,38 @@ mod tests {
         monocoque_core::inproc::unbind_inproc(endpoint)?;
         Ok(())
     }
+
+    #[test]
+    fn test_inproc_stream_preserves_partial_read_remainder() -> io::Result<()> {
+        use compio::buf::BufResult;
+        use compio::io::AsyncRead;
+
+        let endpoint = "inproc://test-stream-partial-read";
+        let (tx1, rx1) = bind_inproc(endpoint)?;
+        let tx2 = connect_inproc(endpoint)?;
+
+        let mut stream1 = InprocStream::new(tx1, rx1);
+        tx2.send(vec![Bytes::from_static(b"hello")]).unwrap();
+        tx2.send(vec![Bytes::from_static(b"next")]).unwrap();
+
+        let rt = compio::runtime::Runtime::new()?;
+        let ((first_n, first_buf), (second_n, second_buf)) = rt.block_on(async {
+            let first_buf = vec![0u8; 2];
+            let BufResult(first_result, first_buf) = AsyncRead::read(&mut stream1, first_buf).await;
+            let first = first_result.map(|n| (n, first_buf))?;
+
+            let second_buf = vec![0u8; 3];
+            let BufResult(second_result, second_buf) =
+                AsyncRead::read(&mut stream1, second_buf).await;
+            let second = second_result.map(|n| (n, second_buf))?;
+
+            io::Result::Ok((first, second))
+        })?;
+
+        assert_eq!(&first_buf[..first_n], b"he");
+        assert_eq!(&second_buf[..second_n], b"llo");
+
+        monocoque_core::inproc::unbind_inproc(endpoint)?;
+        Ok(())
+    }
 }
