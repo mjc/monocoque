@@ -369,6 +369,12 @@ mod tests {
     }
 
     #[test]
+    fn test_with_capacity_rejects_unbounded_capacity_without_panicking() {
+        let result = std::panic::catch_unwind(|| Message::with_capacity(usize::MAX));
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_from_frames() {
         let frames = vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")];
         let msg = Message::from_frames(frames.clone());
