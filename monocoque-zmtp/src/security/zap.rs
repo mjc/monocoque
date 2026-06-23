@@ -447,6 +447,48 @@ mod tests {
     }
 
     #[test]
+    fn zap_response_decode_rejects_unsupported_version() {
+        let frames = vec![
+            Bytes::from("2.0"),
+            Bytes::from("123"),
+            Bytes::from("200"),
+            Bytes::from("OK"),
+            Bytes::from("testuser"),
+            Bytes::new(),
+        ];
+
+        assert!(ZapResponse::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_response_decode_rejects_non_ascii_user_id() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::from("200"),
+            Bytes::from("OK"),
+            Bytes::from_static(b"jos\xc3\xa9"),
+            Bytes::new(),
+        ];
+
+        assert!(ZapResponse::decode(&frames).is_err());
+    }
+
+    #[test]
+    fn zap_response_decode_rejects_overlong_status_text() {
+        let frames = vec![
+            Bytes::from(ZAP_VERSION),
+            Bytes::from("123"),
+            Bytes::from("200"),
+            Bytes::from("a".repeat(256)),
+            Bytes::from("testuser"),
+            Bytes::new(),
+        ];
+
+        assert!(ZapResponse::decode(&frames).is_err());
+    }
+
+    #[test]
     fn test_zap_metadata() {
         let mut response = ZapResponse::success("123", "admin");
         response
