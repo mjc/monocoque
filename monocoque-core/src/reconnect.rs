@@ -195,6 +195,20 @@ mod tests {
     }
 
     #[test]
+    fn test_next_delay_caps_before_duration_overflow() {
+        let options = SocketOptions::default()
+            .with_reconnect_ivl(Duration::MAX)
+            .with_reconnect_ivl_max(Duration::from_secs(1));
+
+        let mut state = ReconnectState::new(&options);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.next_delay();
+        }));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_reset() {
         let options = SocketOptions::default()
             .with_reconnect_ivl(Duration::from_millis(100))
