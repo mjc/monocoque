@@ -166,7 +166,7 @@ impl PushPullProfile {
         let sender_start = std::time::Instant::now();
         self.push_rt.block_on(async {
             for _ in 0..count {
-                self.push.send(vec![self.payload.clone()]).await.unwrap();
+                self.push.send_one(self.payload.clone()).await.unwrap();
             }
             self.push.flush().await.unwrap();
         });

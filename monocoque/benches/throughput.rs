@@ -128,7 +128,7 @@ impl MonocoquePushPullBench {
         self.command_tx.send(count).unwrap();
         self.push_rt.block_on(async {
             for _ in 0..count {
-                self.push.send(vec![self.payload.clone()]).await.unwrap();
+                self.push.send_one(self.payload.clone()).await.unwrap();
             }
             if self.coalesced {
                 self.push.flush().await.unwrap();
