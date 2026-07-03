@@ -46,6 +46,13 @@ impl SegmentedBuffer {
         self.len == 0
     }
 
+    /// Return the first contiguous chunk without consuming it.
+    #[inline]
+    #[must_use]
+    pub fn front_chunk(&self) -> &[u8] {
+        self.segs.front().map_or(&[], Bytes::as_ref)
+    }
+
     #[inline]
     pub fn push(&mut self, bytes: Bytes) {
         if bytes.is_empty() {
@@ -146,5 +153,79 @@ impl SegmentedBuffer {
         }
 
         Some(out.freeze())
+    }
+
+    /// Skip `skip` bytes, then take `n` bytes from the front of the queue.
+    ///
+    /// When the whole range sits in the first segment, this avoids the
+    /// `advance(skip)` pop/push round trip before extracting the payload.
+    #[inline]
+    pub fn take_bytes_after(&mut self, skip: usize, n: usize) -> Option<Bytes> {
+        let total = skip.checked_add(n)?;
+        if total > self.len {
+            return None;
+        }
+        Some(self.take_bytes_after_available(skip, n))
+    }
+
+    /// Skip `skip` bytes, then take `n` bytes when the caller has checked availability.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `skip + n` overflows or exceeds the buffered length.
+    #[inline]
+    pub fn take_bytes_after_available(&mut self, skip: usize, n: usize) -> Bytes {
+        let total = skip.checked_add(n).expect("skip + n must not overflow");
+        assert!(total <= self.len);
+        if n == 0 {
+            self.advance(skip);
+            return Bytes::new();
+        }
+
+        let front = self.segs.front_mut().expect("non-empty buffer");
+        if front.len() >= total {
+            self.len -= total;
+            front.advance(skip);
+            let out = front.split_to(n);
+            if front.is_empty() {
+                self.segs.pop_front();
+            }
+            return out;
+        }
+
+        self.advance(skip);
+        self.take_bytes(n)
+            .expect("len check ensures requested bytes are available")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SegmentedBuffer;
+    use bytes::Bytes;
+
+    #[test]
+    fn take_bytes_after_slices_within_front_segment() {
+        let mut buf = SegmentedBuffer::new();
+        buf.push(Bytes::from_static(b"hhpayloadtail"));
+
+        let payload = buf.take_bytes_after(2, 7).unwrap();
+
+        assert_eq!(&payload[..], b"payload");
+        assert_eq!(buf.len(), 4);
+        assert_eq!(&buf.take_bytes(4).unwrap()[..], b"tail");
+    }
+
+    #[test]
+    fn take_bytes_after_falls_back_across_segments() {
+        let mut buf = SegmentedBuffer::new();
+        buf.push(Bytes::from_static(b"hhpay"));
+        buf.push(Bytes::from_static(b"loadtail"));
+
+        let payload = buf.take_bytes_after(2, 7).unwrap();
+
+        assert_eq!(&payload[..], b"payload");
+        assert_eq!(buf.len(), 4);
+        assert_eq!(&buf.take_bytes(4).unwrap()[..], b"tail");
     }
 }
