@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BACKEND: &str = if cfg!(feature = "runtime-tokio") {
     "tokio"
@@ -293,29 +293,42 @@ fn parse_cases_from_all() -> Vec<ProfileCase> {
 
 fn run_zmtp_profile(mode: RecvMode) {
     let mut profile = PushPullProfile::new(mode);
-    for _ in 0..WARMUP_BATCHES {
+    let warmups = env_usize("MONOCOQUE_PROFILE_WARMUPS").unwrap_or(WARMUP_BATCHES);
+    let batches = env_usize("MONOCOQUE_PROFILE_BATCHES").unwrap_or(BATCHES);
+    let duration = env_duration("MONOCOQUE_PROFILE_DURATION_SECS");
+
+    for _ in 0..warmups {
         profile.run_batch(BATCH_SIZE);
     }
 
-    let mut sender = Vec::with_capacity(BATCHES);
-    let mut receiver = Vec::with_capacity(BATCHES);
-    for _ in 0..BATCHES {
-        let (sender_elapsed, receiver_elapsed) = profile.run_batch(BATCH_SIZE);
-        sender.push(sender_elapsed);
-        receiver.push(receiver_elapsed);
+    let mut sender = Vec::with_capacity(batches);
+    let mut receiver = Vec::with_capacity(batches);
+    if let Some(duration) = duration {
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            let (sender_elapsed, receiver_elapsed) = profile.run_batch(BATCH_SIZE);
+            sender.push(sender_elapsed);
+            receiver.push(receiver_elapsed);
+        }
+    } else {
+        for _ in 0..batches {
+            let (sender_elapsed, receiver_elapsed) = profile.run_batch(BATCH_SIZE);
+            sender.push(sender_elapsed);
+            receiver.push(receiver_elapsed);
+        }
     }
 
-    print_summary(mode, &sender, &receiver);
+    print_summary(mode, sender.len(), &sender, &receiver);
 }
 
-fn print_summary(mode: RecvMode, sender: &[Duration], receiver: &[Duration]) {
+fn print_summary(mode: RecvMode, batches: usize, sender: &[Duration], receiver: &[Duration]) {
     let sender_median = median(sender);
     let receiver_median = median(receiver);
     let sender_best = sender.iter().min().copied().unwrap();
     let receiver_best = receiver.iter().min().copied().unwrap();
 
     println!(
-        "{BACKEND} {mode} {MESSAGE_SIZE}B coalesced, {BATCHES}x{BATCH_SIZE} messages",
+        "{BACKEND} {mode} {MESSAGE_SIZE}B coalesced, {batches}x{BATCH_SIZE} messages",
         mode = mode.name()
     );
     println!(
@@ -334,6 +347,15 @@ fn print_summary(mode: RecvMode, sender: &[Duration], receiver: &[Duration]) {
     );
 }
 
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn env_duration(name: &str) -> Option<Duration> {
+    let seconds: u64 = std::env::var(name).ok()?.parse().ok()?;
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
 fn run_raw_profile(
     label: &str,
     messages_per_sample: usize,
@@ -341,19 +363,31 @@ fn run_raw_profile(
     batches: usize,
     mut run_batch: impl FnMut() -> (Duration, Duration),
 ) {
+    let duration = env_duration("MONOCOQUE_PROFILE_DURATION_SECS");
+
     for _ in 0..warmups {
         run_batch();
     }
 
     let mut sender = Vec::with_capacity(batches);
     let mut receiver = Vec::with_capacity(batches);
-    for _ in 0..batches {
-        let (sender_elapsed, receiver_elapsed) = run_batch();
-        sender.push(sender_elapsed);
-        receiver.push(receiver_elapsed);
-        coz_progress!();
+    if let Some(duration) = duration {
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            let (sender_elapsed, receiver_elapsed) = run_batch();
+            sender.push(sender_elapsed);
+            receiver.push(receiver_elapsed);
+            coz_progress!();
+        }
+    } else {
+        for _ in 0..batches {
+            let (sender_elapsed, receiver_elapsed) = run_batch();
+            sender.push(sender_elapsed);
+            receiver.push(receiver_elapsed);
+            coz_progress!();
+        }
     }
-    print_raw_summary(label, messages_per_sample, batches, &sender, &receiver);
+    print_raw_summary(label, messages_per_sample, sender.len(), &sender, &receiver);
 }
 
 fn median(values: &[Duration]) -> Duration {
