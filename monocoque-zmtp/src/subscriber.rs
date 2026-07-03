@@ -381,11 +381,13 @@ impl SubSocket<TcpStream> {
     /// Try to reconnect to the stored endpoint and re-send all active subscriptions.
     pub async fn try_reconnect(&mut self) -> io::Result<()> {
         self.base.try_reconnect(SocketType::Sub).await?;
-        let subs = std::mem::take(&mut self.subscriptions);
+        let subs = self.subscriptions.clone();
         for prefix in &subs {
-            self.send_sub_event(0x01, prefix).await?;
+            if let Err(e) = self.send_sub_event(0x01, prefix).await {
+                self.base.stream = None;
+                return Err(e);
+            }
         }
-        self.subscriptions = subs;
         Ok(())
     }
 

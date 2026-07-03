@@ -95,13 +95,8 @@ where
 
         if self.base.options.write_coalescing {
             self.base.send_coalesced(&msg).await?;
-        } else if self.base.should_vectored_write(&msg) {
-            // Large frame: write header + body as an iovec, skipping the copy
-            // into the userspace send buffer.
-            self.base.send_vectored(&msg).await?;
         } else {
-            self.base.encode_message_to_write_buf(&msg)?;
-            self.base.write_from_buf().await?;
+            self.base.write_direct(&msg).await?;
         }
 
         // Check heartbeat: send PING if the connection has been idle too long
@@ -127,12 +122,7 @@ where
             }
         } else {
             let msg = std::slice::from_ref(&frame);
-            if self.base.should_vectored_write(msg) {
-                self.base.send_vectored(msg).await?;
-            } else {
-                self.base.encode_message_to_write_buf(msg)?;
-                self.base.write_from_buf().await?;
-            }
+            self.base.write_direct(msg).await?;
         }
 
         if self.base.check_heartbeat()? {

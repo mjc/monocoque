@@ -21,9 +21,8 @@
 //!                                      XPUB ────────┴──> Forwards subscriptions
 //! ```
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use monocoque_core::options::SocketOptions;
-use monocoque_core::prelude::IoArena;
 use monocoque_core::rt::{TcpListener, TcpStream};
 use monocoque_core::subscription::{SubscriptionEvent, SubscriptionTrie};
 use smallvec::SmallVec;
@@ -32,6 +31,7 @@ use std::fmt;
 use std::io;
 use tracing::{debug, trace};
 
+use crate::base::{READ_SLAB_SIZE, take_read_buffer};
 use crate::handshake::perform_handshake_with_options;
 use crate::session::SocketType;
 use crate::xsub::XSubSocket;
@@ -45,6 +45,7 @@ struct XPubSubscriber {
     stream: TcpStream,
     subscriptions: SubscriptionTrie,
     recv_buf: monocoque_core::buffer::SegmentedBuffer,
+    read_buf: BytesMut,
     decoder: crate::codec::ZmtpDecoder,
     curve_cipher: Option<crate::security::curve::CurveMessageCipher>,
 }
@@ -220,6 +221,7 @@ impl XPubSocket {
                         stream,
                         subscriptions: SubscriptionTrie::new(),
                         recv_buf: monocoque_core::buffer::SegmentedBuffer::new(),
+                        read_buf: BytesMut::with_capacity(READ_SLAB_SIZE),
                         decoder: self.options.max_msg_size.map_or_else(
                             crate::codec::ZmtpDecoder::new,
                             crate::codec::ZmtpDecoder::with_max_frame_size,
@@ -240,6 +242,35 @@ impl XPubSocket {
                 Ok(())
             }
             Err(e) => Err(e),
+        }
+    }
+
+    fn remove_subscriber(&mut self, id: SubscriberId) {
+        let Some(sub) = self.subscribers.remove(&id) else {
+            return;
+        };
+
+        for subscription in sub.subscriptions.subscriptions() {
+            self.decrement_topic_refcount(&subscription.prefix);
+        }
+
+        debug!("[XPUB] Removed dead subscriber {}", id);
+    }
+
+    fn decrement_topic_refcount(&mut self, prefix: &[u8]) {
+        let key = prefix.to_vec();
+        let remove = match self.topic_refcount.get_mut(&key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+
+        if remove {
+            self.topic_refcount.remove(&key);
+            self.seen_topics.remove(&key);
         }
     }
 
@@ -271,8 +302,6 @@ impl XPubSocket {
         use compio_io::AsyncRead;
         use monocoque_core::rt::timeout;
         use std::time::Duration;
-        let mut arena = IoArena::new();
-
         // Return pending events first
         if !self.pending_events.is_empty() {
             return Ok(Some(self.pending_events.remove(0)));
@@ -286,17 +315,29 @@ impl XPubSocket {
             "[XPUB] Polling {} subscribers for subscription events",
             self.subscribers.len()
         );
+        let mut dead_subs = Vec::new();
+
         for sub in self.subscribers.values_mut() {
-            let slab = arena.alloc_mut(256);
+            // SAFETY: `buf` is passed directly to `read`; on success it is
+            // truncated to `n` before freezing, and timeout/error/EOF paths drop
+            // it without inspecting its contents.
+            let buf = unsafe { take_read_buffer(&mut sub.read_buf, 256) };
 
             // Use a short timeout to avoid blocking
-            let read_result = timeout(Duration::from_millis(1), sub.stream.read(slab)).await;
+            let read_result = timeout(Duration::from_millis(1), sub.stream.read(buf)).await;
 
             match read_result {
-                Ok(BufResult(Ok(n), slab)) if n > 0 => {
+                Ok(BufResult(Ok(n), mut buf)) => {
+                    if n == 0 {
+                        debug!("[XPUB] Subscriber {} disconnected", sub.id);
+                        dead_subs.push(sub.id);
+                        continue;
+                    }
+
                     trace!("[XPUB] Received {} bytes from subscriber {}", n, sub.id);
                     debug_assert!(n <= 256);
-                    sub.recv_buf.push(slab.freeze());
+                    buf.truncate(n);
+                    sub.recv_buf.push(buf.freeze());
 
                     // Drain all complete ZMTP frames from the buffer
                     loop {
@@ -419,7 +460,6 @@ impl XPubSocket {
                         }
                     }
                 }
-                Ok(BufResult(Ok(_), _)) => {}
                 Ok(BufResult(Err(e), _)) => {
                     if e.kind() != std::io::ErrorKind::WouldBlock {
                         debug!("[XPUB] Error reading from subscriber {}: {}", sub.id, e);
@@ -429,6 +469,10 @@ impl XPubSocket {
                     // Timeout  -  no data available from this subscriber
                 }
             }
+        }
+
+        for id in dead_subs {
+            self.remove_subscriber(id);
         }
 
         // Return any events collected from this poll round
@@ -516,8 +560,7 @@ impl XPubSocket {
         }
 
         for id in dead_subs {
-            self.subscribers.remove(&id);
-            debug!("[XPUB] Removed dead subscriber {}", id);
+            self.remove_subscriber(id);
         }
 
         Ok(())
@@ -743,6 +786,30 @@ mod tests {
         assert_eq!(xpub.subscriber_count(), 0);
         let addr = xpub.local_addr().unwrap();
         assert!(addr.port() > 0);
+    }
+
+    #[test]
+    fn test_xpub_topic_refcount_cleanup() {
+        monocoque_core::rt::LocalRuntime::new()
+            .unwrap()
+            .block_on(test_xpub_topic_refcount_cleanup_impl())
+    }
+
+    async fn test_xpub_topic_refcount_cleanup_impl() {
+        let mut xpub = XPubSocket::bind("127.0.0.1:0").await.unwrap();
+        let topic = Bytes::from_static(b"weather");
+        let key = topic.to_vec();
+
+        xpub.topic_refcount.insert(key.clone(), 2);
+        xpub.seen_topics.insert(key.clone());
+
+        xpub.decrement_topic_refcount(&topic);
+        assert_eq!(xpub.topic_refcount.get(&key), Some(&1));
+        assert!(xpub.seen_topics.contains(&key));
+
+        xpub.decrement_topic_refcount(&topic);
+        assert!(!xpub.topic_refcount.contains_key(&key));
+        assert!(!xpub.seen_topics.contains(&key));
     }
 
     #[test]

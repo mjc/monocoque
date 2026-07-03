@@ -388,6 +388,28 @@ mod tests {
     }
 
     #[test]
+    fn encode_single_matches_single_frame_multipart_short_and_long() {
+        for part in [Bytes::from_static(b"short"), Bytes::from(vec![0xAB; 256])] {
+            let mut single = BytesMut::new();
+            encode_single(&part, &mut single);
+
+            let mut multipart = BytesMut::new();
+            encode_multipart(std::slice::from_ref(&part), &mut multipart);
+
+            assert_eq!(single, multipart);
+            if part.len() >= 256 {
+                assert_eq!(single[0], 0x02);
+                assert_eq!(&single[1..9], (part.len() as u64).to_be_bytes().as_slice());
+                assert_eq!(&single[9..], &part[..]);
+            } else {
+                assert_eq!(single[0], 0x00);
+                assert_eq!(single[1], part.len() as u8);
+                assert_eq!(&single[2..], &part[..]);
+            }
+        }
+    }
+
+    #[test]
     fn encode_multipart_multi_frame_appends_to_preallocated_buffer() {
         let msg = vec![Bytes::from_static(b"a"), Bytes::from_static(b"bc")];
         let mut buf = BytesMut::with_capacity(16);

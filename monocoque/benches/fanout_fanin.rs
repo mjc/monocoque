@@ -48,6 +48,7 @@ fn coalescing_options() -> SocketOptions {
 
 struct FanoutBench {
     worker_command_txs: Vec<mpsc::Sender<usize>>,
+    worker_started_rx: mpsc::Receiver<()>,
     worker_elapsed_rx: mpsc::Receiver<Duration>,
     vent_command_tx: mpsc::Sender<usize>,
     vent_done_rx: mpsc::Receiver<()>,
@@ -92,11 +93,13 @@ impl FanoutBench {
 
         let port = port_rx.recv().unwrap();
         let mut worker_command_txs = Vec::with_capacity(WORKERS);
+        let (worker_started_tx, worker_started_rx) = mpsc::channel::<()>();
         let (worker_elapsed_tx, worker_elapsed_rx) = mpsc::channel::<Duration>();
 
         for _ in 0..WORKERS {
             let (worker_command_tx, worker_command_rx) = mpsc::channel::<usize>();
             worker_command_txs.push(worker_command_tx);
+            let worker_started_tx = worker_started_tx.clone();
             let worker_elapsed_tx = worker_elapsed_tx.clone();
 
             threads.push(thread::spawn(move || {
@@ -110,6 +113,7 @@ impl FanoutBench {
                         }
 
                         let t0 = Instant::now();
+                        worker_started_tx.send(()).unwrap();
                         for _ in 0..count {
                             pull.recv().await.unwrap();
                         }
@@ -118,11 +122,13 @@ impl FanoutBench {
                 });
             }));
         }
+        drop(worker_started_tx);
         drop(worker_elapsed_tx);
         ready_rx.recv().unwrap();
 
         let mut bench = Self {
             worker_command_txs,
+            worker_started_rx,
             worker_elapsed_rx,
             vent_command_tx,
             vent_done_rx,
@@ -146,6 +152,9 @@ impl FanoutBench {
 
         for tx in &self.worker_command_txs {
             tx.send(per_worker).unwrap();
+        }
+        for _ in 0..WORKERS {
+            self.worker_started_rx.recv().unwrap();
         }
         self.vent_command_tx.send(count).unwrap();
 
@@ -174,6 +183,7 @@ struct FaninBench {
     worker_command_txs: Vec<mpsc::Sender<usize>>,
     worker_done_rx: mpsc::Receiver<()>,
     sink_command_tx: mpsc::Sender<usize>,
+    sink_started_rx: mpsc::Receiver<()>,
     elapsed_rx: mpsc::Receiver<Duration>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -184,6 +194,7 @@ impl FaninBench {
         let (port_tx, port_rx) = mpsc::channel::<u16>();
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (sink_command_tx, sink_command_rx) = mpsc::channel::<usize>();
+        let (sink_started_tx, sink_started_rx) = mpsc::channel::<()>();
         let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
         let mut threads = Vec::with_capacity(WORKERS + 1);
 
@@ -208,11 +219,14 @@ impl FaninBench {
                     }
 
                     let t0 = Instant::now();
+                    sink_started_tx.send(()).unwrap();
                     let mut received = 0usize;
                     while received < count {
                         match sink.recv_batch().await.unwrap() {
                             Some(batch) => received += batch.len(),
-                            None => break,
+                            None => panic!(
+                                "fan-in sink closed before receiving {count} messages; got {received}"
+                            ),
                         }
                     }
                     elapsed_tx.send(t0.elapsed()).unwrap();
@@ -263,6 +277,7 @@ impl FaninBench {
             worker_command_txs,
             worker_done_rx,
             sink_command_tx,
+            sink_started_rx,
             elapsed_rx,
             threads,
         };
@@ -283,6 +298,7 @@ impl FaninBench {
         let per_worker = count / WORKERS;
 
         self.sink_command_tx.send(count).unwrap();
+        self.sink_started_rx.recv().unwrap();
         for tx in &self.worker_command_txs {
             tx.send(per_worker).unwrap();
         }

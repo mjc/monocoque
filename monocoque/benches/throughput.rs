@@ -45,6 +45,7 @@ struct MonocoquePushPullBench {
     push_rt: monocoque::rt::LocalRuntime,
     push: PushSocket,
     command_tx: mpsc::Sender<usize>,
+    started_rx: mpsc::Receiver<()>,
     elapsed_rx: mpsc::Receiver<Duration>,
     pull_thread: Option<JoinHandle<()>>,
 }
@@ -53,6 +54,7 @@ impl MonocoquePushPullBench {
     fn new(size: usize, coalesced: bool, recv_mode: MonocoqueRecvMode) -> Self {
         let (port_tx, port_rx) = mpsc::channel::<u16>();
         let (command_tx, command_rx) = mpsc::channel::<usize>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
         let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
 
         let pull_thread = thread::spawn(move || {
@@ -76,6 +78,7 @@ impl MonocoquePushPullBench {
                     }
 
                     let t0 = Instant::now();
+                    started_tx.send(()).unwrap();
                     for _ in 0..count {
                         match recv_mode {
                             MonocoqueRecvMode::Allocating => {
@@ -109,6 +112,7 @@ impl MonocoquePushPullBench {
             push_rt,
             push,
             command_tx,
+            started_rx,
             elapsed_rx,
             pull_thread: Some(pull_thread),
         };
@@ -126,6 +130,7 @@ impl MonocoquePushPullBench {
 
     fn run_batch(&mut self, count: usize) -> Duration {
         self.command_tx.send(count).unwrap();
+        self.started_rx.recv().unwrap();
         self.push_rt.block_on(async {
             for _ in 0..count {
                 self.push.send_one(self.payload.clone()).await.unwrap();
@@ -152,6 +157,7 @@ struct ZmqPushPullBench {
     push: zmq::Socket,
     _ctx: zmq::Context,
     command_tx: mpsc::Sender<usize>,
+    started_rx: mpsc::Receiver<()>,
     elapsed_rx: mpsc::Receiver<Duration>,
     pull_thread: Option<JoinHandle<()>>,
 }
@@ -160,6 +166,7 @@ impl ZmqPushPullBench {
     fn new(size: usize) -> Self {
         let (endpoint_tx, endpoint_rx) = mpsc::channel::<String>();
         let (command_tx, command_rx) = mpsc::channel::<usize>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
         let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
 
         let pull_thread = thread::spawn(move || {
@@ -176,6 +183,7 @@ impl ZmqPushPullBench {
                 }
 
                 let t0 = Instant::now();
+                started_tx.send(()).unwrap();
                 for _ in 0..count {
                     pull.recv_bytes(0).unwrap();
                 }
@@ -195,6 +203,7 @@ impl ZmqPushPullBench {
             push,
             _ctx: ctx,
             command_tx,
+            started_rx,
             elapsed_rx,
             pull_thread: Some(pull_thread),
         };
@@ -212,6 +221,7 @@ impl ZmqPushPullBench {
 
     fn run_batch(&mut self, count: usize) -> Duration {
         self.command_tx.send(count).unwrap();
+        self.started_rx.recv().unwrap();
         for _ in 0..count {
             self.push.send(&self.payload, 0).unwrap();
         }
