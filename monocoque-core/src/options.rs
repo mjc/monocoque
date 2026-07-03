@@ -511,7 +511,7 @@ impl Default for SocketOptions {
             xpub_nodrop: false,
             invert_matching: false,
             write_coalescing: false,
-            write_coalesce_threshold: 65536,
+            write_coalesce_threshold: 96 * 1024,
             vectored_write_threshold: 32768,
         }
     }

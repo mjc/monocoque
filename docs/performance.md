@@ -38,7 +38,7 @@ iteration, after 1 000 warmup rounds on a fresh connection.
 ### Throughput - PUSH/PULL one-way, 10 000 messages
 
 `eager` - default mode, one kernel write per `send()`.
-`coalesced` - `with_write_coalescing(true)`, messages accumulate in a 64 KB
+`coalesced` - `with_write_coalescing(true)`, messages accumulate in a 96 KB
 buffer flushed in one syscall; call `flush()` after the last send.
 
 Eager mode (one syscall per message):
@@ -51,23 +51,23 @@ Eager mode (one syscall per message):
 | 4 KB | 292 K msg/s | 417 K msg/s | 328 K msg/s |
 | 16 KB | 266 K msg/s | 317 K msg/s | 117 K msg/s |
 
-Write coalescing (batched into 64 KB writes):
+Write coalescing (batched into 96 KB writes):
 
 | Message size | compio | tokio | rust-zmq |
 |---|---|---|---|
-| 64 B | 9.2 M msg/s | **13.6 M msg/s** | 1.33 M msg/s |
-| 256 B | 5.6 M msg/s | **9.8 M msg/s** | 1.09 M msg/s |
-| 1 KB | 2.4 M msg/s | **5.3 M msg/s** | 656 K msg/s |
-| 4 KB | 841 K msg/s | **1.74 M msg/s** | 328 K msg/s |
-| 16 KB | 268 K msg/s | **473 K msg/s** | 117 K msg/s |
+| 64 B | 21.1 M msg/s | **23.7 M msg/s** | 1.33 M msg/s |
+| 256 B | 12.3 M msg/s | **12.8 M msg/s** | 1.09 M msg/s |
+| 1 KB | **4.2 M msg/s** | 4.2 M msg/s | 656 K msg/s |
+| 4 KB | 1.07 M msg/s | **1.14 M msg/s** | 328 K msg/s |
+| 16 KB | 250 K msg/s | **328 K msg/s** | 117 K msg/s |
 
 In eager mode both backends trail libzmq because each `send()` is one kernel
 write (an io_uring SQE on compio, a `write` syscall on tokio) while libzmq
 amortizes the syscall over an internal IO-thread batch. Write coalescing closes
-that gap and then some: it batches ~970 x 64 B messages (or ~240 x 256 B) into
+that gap and then some: it batches ~1 400 x 64 B messages (or ~350 x 256 B) into
 one `write_all()` call, eliminating the per-message kernel boundary crossing.
-Coalesced, both backends beat libzmq by a wide margin: from ~7x (compio) and
-~10x (tokio) at 64 B down to ~2.3x and ~4.0x at 16 KB. monocoque's coalescing is
+Coalesced, both backends beat libzmq by a wide margin: from ~16x (compio) and
+~18x (tokio) at 64 B down to ~2.1x and ~2.8x at 16 KB. monocoque's coalescing is
 explicit rather than a scheduling side effect, and achieves a higher batch ratio
 with zero intermediate copies.
 
@@ -190,7 +190,7 @@ let mut push = PushSocket::connect_with_options(
     SocketOptions::default().with_write_coalescing(true),
 ).await?;
 
-// Messages accumulate in a 64 KB buffer; the kernel write fires when the
+// Messages accumulate in a 96 KB buffer; the kernel write fires when the
 // buffer fills or when flush() is called.
 for msg in &batch {
     push.send(vec![msg.clone()]).await?;
@@ -203,11 +203,11 @@ Tuning the threshold:
 ```rust
 SocketOptions::default()
     .with_write_coalescing(true)
-    .with_write_coalesce_threshold(32_768)  // flush at 32 KB instead of 64 KB
+    .with_write_coalesce_threshold(32_768)  // flush at 32 KB instead of 96 KB
 ```
 
 Smaller thresholds lower the latency tail at the cost of slightly fewer messages
-per syscall. The default 64 KB is optimal for sustained throughput on loopback.
+per syscall. The default 96 KB is tuned for sustained throughput on loopback.
 
 ---
 
@@ -229,7 +229,7 @@ completes.
 The consequence is that batching requires a deliberate choice. When eager mode
 (the default) is used, after `send()` returns the bytes are inside the kernel.
 When coalescing is enabled, they may still be in a userspace buffer waiting for
-the 64 KB threshold to fill. That difference matters in a few real situations:
+the 96 KB threshold to fill. That difference matters in a few real situations:
 
 - If your process crashes between `send()` and `flush()`, coalesced messages
   are lost. Eager-mode messages are already in the kernel buffer and will survive.
@@ -286,7 +286,7 @@ let opts = SocketOptions::default().with_vectored_write_threshold(usize::MAX);
 Notes and limits:
 
 - Applies in **eager** mode only. With write coalescing enabled, messages are
-  batched into the 64 KB buffer instead (the two strategies serve different
+  batched into the 96 KB buffer instead (the two strategies serve different
   workloads: coalescing wins for small-message bursts, vectored writes for large
   frames).
 - Skipped for **CURVE**-encrypted connections: the cipher rewrites each body into
@@ -348,10 +348,10 @@ while pull.recv_into(&mut buf).await? {
 }
 ```
 
-On the coalesced PUSH/PULL throughput bench this lifts 64 B from 9.2 M to 11.3 M
-msg/s on compio (about 1.23x) and from 13.6 M to 15.7 M on tokio, plus ~13% at
-256 B; the gain tapers as messages grow and the path becomes bandwidth-bound. `recv()` and `try_recv()` are unchanged for callers
-that want an owned `Vec`. A runnable example lives at
+On the coalesced PUSH/PULL throughput bench this now lifts 64 B by about 4% on
+both compio and tokio, with a 2-4% gain at 256 B; the gain tapers as messages
+grow and the path becomes bandwidth-bound. `recv()` and `try_recv()` are
+unchanged for callers that want an owned `Vec`. A runnable example lives at
 `examples/recv_into_zero_alloc.rs`.
 
 ---
