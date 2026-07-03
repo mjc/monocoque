@@ -9,7 +9,8 @@
 //! - Every socket runs on its own OS thread with its own compio runtime.
 //! - `BATCH_SIZE` messages cross the pool per iteration, split evenly across
 //!   `WORKERS` connections.
-//! - Connection setup and the ZMTP handshake happen outside the timed window.
+//! - Runtime, worker, connection setup, and the ZMTP handshake happen once per
+//!   benchmark case and outside the timed window.
 //! - Senders use write coalescing with a final flush, matching the maximum
 //!   throughput path used by the cross-implementation bench peer.
 //!
@@ -32,19 +33,278 @@ const BENCH_BACKEND: &str = if cfg!(feature = "runtime-tokio") {
 use monocoque::rt::TcpListener;
 use monocoque::zmq::{PullFanIn, PullSocket, PushFanOut, PushSocket, SocketOptions};
 use std::sync::mpsc;
-use std::sync::{Arc, Barrier};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const MESSAGE_SIZES: &[usize] = &[64, 1024, 16384];
 const BATCH_SIZE: usize = 10_000;
 const WORKERS: usize = 4;
-const PER_WORKER: usize = BATCH_SIZE / WORKERS;
 
 fn coalescing_options() -> SocketOptions {
     SocketOptions::default()
         .with_buffer_sizes(16384, 16384)
         .with_write_coalescing(true)
+}
+
+struct FanoutBench {
+    worker_command_txs: Vec<mpsc::Sender<usize>>,
+    worker_elapsed_rx: mpsc::Receiver<Duration>,
+    vent_command_tx: mpsc::Sender<usize>,
+    vent_done_rx: mpsc::Receiver<()>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl FanoutBench {
+    fn new(size: usize) -> Self {
+        let payload = Bytes::from(vec![0u8; size]);
+        let (port_tx, port_rx) = mpsc::channel::<u16>();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (vent_command_tx, vent_command_rx) = mpsc::channel::<usize>();
+        let (vent_done_tx, vent_done_rx) = mpsc::channel::<()>();
+        let mut threads = Vec::with_capacity(WORKERS + 1);
+
+        let vent_payload = payload.clone();
+        threads.push(thread::spawn(move || {
+            let rt = monocoque::rt::LocalRuntime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                port_tx.send(listener.local_addr().unwrap().port()).unwrap();
+
+                let mut fanout =
+                    PushFanOut::accept_workers(&listener, WORKERS, coalescing_options())
+                        .await
+                        .unwrap();
+                ready_tx.send(()).unwrap();
+
+                while let Ok(count) = vent_command_rx.recv() {
+                    if count == 0 {
+                        break;
+                    }
+
+                    for _ in 0..count {
+                        fanout.send_one(vent_payload.clone()).await.unwrap();
+                    }
+                    fanout.flush().await.unwrap();
+                    vent_done_tx.send(()).unwrap();
+                }
+            });
+        }));
+
+        let port = port_rx.recv().unwrap();
+        let mut worker_command_txs = Vec::with_capacity(WORKERS);
+        let (worker_elapsed_tx, worker_elapsed_rx) = mpsc::channel::<Duration>();
+
+        for _ in 0..WORKERS {
+            let (worker_command_tx, worker_command_rx) = mpsc::channel::<usize>();
+            worker_command_txs.push(worker_command_tx);
+            let worker_elapsed_tx = worker_elapsed_tx.clone();
+
+            threads.push(thread::spawn(move || {
+                let rt = monocoque::rt::LocalRuntime::new().unwrap();
+                rt.block_on(async move {
+                    let mut pull = PullSocket::connect(("127.0.0.1", port)).await.unwrap();
+
+                    while let Ok(count) = worker_command_rx.recv() {
+                        if count == 0 {
+                            break;
+                        }
+
+                        let t0 = Instant::now();
+                        for _ in 0..count {
+                            pull.recv().await.unwrap();
+                        }
+                        worker_elapsed_tx.send(t0.elapsed()).unwrap();
+                    }
+                });
+            }));
+        }
+        drop(worker_elapsed_tx);
+        ready_rx.recv().unwrap();
+
+        let mut bench = Self {
+            worker_command_txs,
+            worker_elapsed_rx,
+            vent_command_tx,
+            vent_done_rx,
+            threads,
+        };
+        bench.run_batch(WORKERS);
+        bench
+    }
+
+    fn run_iterations(&mut self, iters: u64) -> Duration {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            total += self.run_batch(BATCH_SIZE);
+        }
+        total
+    }
+
+    fn run_batch(&mut self, count: usize) -> Duration {
+        assert_eq!(count % WORKERS, 0);
+        let per_worker = count / WORKERS;
+
+        for tx in &self.worker_command_txs {
+            tx.send(per_worker).unwrap();
+        }
+        self.vent_command_tx.send(count).unwrap();
+
+        let mut slowest = Duration::ZERO;
+        for _ in 0..WORKERS {
+            slowest = slowest.max(self.worker_elapsed_rx.recv().unwrap());
+        }
+        self.vent_done_rx.recv().unwrap();
+        slowest
+    }
+}
+
+impl Drop for FanoutBench {
+    fn drop(&mut self) {
+        let _ = self.vent_command_tx.send(0);
+        for tx in &self.worker_command_txs {
+            let _ = tx.send(0);
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct FaninBench {
+    worker_command_txs: Vec<mpsc::Sender<usize>>,
+    worker_done_rx: mpsc::Receiver<()>,
+    sink_command_tx: mpsc::Sender<usize>,
+    elapsed_rx: mpsc::Receiver<Duration>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl FaninBench {
+    fn new(size: usize, coalesce: bool) -> Self {
+        let payload = Bytes::from(vec![0u8; size]);
+        let (port_tx, port_rx) = mpsc::channel::<u16>();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (sink_command_tx, sink_command_rx) = mpsc::channel::<usize>();
+        let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
+        let mut threads = Vec::with_capacity(WORKERS + 1);
+
+        threads.push(thread::spawn(move || {
+            let rt = monocoque::rt::LocalRuntime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                port_tx.send(listener.local_addr().unwrap().port()).unwrap();
+
+                let mut sink = PullFanIn::accept_workers(
+                    &listener,
+                    WORKERS,
+                    SocketOptions::default().with_buffer_sizes(16384, 16384),
+                )
+                .await
+                .unwrap();
+                ready_tx.send(()).unwrap();
+
+                while let Ok(count) = sink_command_rx.recv() {
+                    if count == 0 {
+                        break;
+                    }
+
+                    let t0 = Instant::now();
+                    let mut received = 0usize;
+                    while received < count {
+                        match sink.recv_batch().await.unwrap() {
+                            Some(batch) => received += batch.len(),
+                            None => break,
+                        }
+                    }
+                    elapsed_tx.send(t0.elapsed()).unwrap();
+                }
+            });
+        }));
+
+        let port = port_rx.recv().unwrap();
+        let mut worker_command_txs = Vec::with_capacity(WORKERS);
+        let (worker_done_tx, worker_done_rx) = mpsc::channel::<()>();
+
+        for _ in 0..WORKERS {
+            let (worker_command_tx, worker_command_rx) = mpsc::channel::<usize>();
+            worker_command_txs.push(worker_command_tx);
+            let worker_done_tx = worker_done_tx.clone();
+            let worker_payload = payload.clone();
+
+            threads.push(thread::spawn(move || {
+                let rt = monocoque::rt::LocalRuntime::new().unwrap();
+                rt.block_on(async move {
+                    let options = if coalesce {
+                        coalescing_options()
+                    } else {
+                        SocketOptions::default().with_buffer_sizes(16384, 16384)
+                    };
+                    let mut push = PushSocket::connect_with_options(("127.0.0.1", port), options)
+                        .await
+                        .unwrap();
+
+                    while let Ok(count) = worker_command_rx.recv() {
+                        if count == 0 {
+                            break;
+                        }
+
+                        for _ in 0..count {
+                            push.send_one(worker_payload.clone()).await.unwrap();
+                        }
+                        push.flush().await.unwrap();
+                        worker_done_tx.send(()).unwrap();
+                    }
+                });
+            }));
+        }
+        drop(worker_done_tx);
+        ready_rx.recv().unwrap();
+
+        let mut bench = Self {
+            worker_command_txs,
+            worker_done_rx,
+            sink_command_tx,
+            elapsed_rx,
+            threads,
+        };
+        bench.run_batch(WORKERS);
+        bench
+    }
+
+    fn run_iterations(&mut self, iters: u64) -> Duration {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            total += self.run_batch(BATCH_SIZE);
+        }
+        total
+    }
+
+    fn run_batch(&mut self, count: usize) -> Duration {
+        assert_eq!(count % WORKERS, 0);
+        let per_worker = count / WORKERS;
+
+        self.sink_command_tx.send(count).unwrap();
+        for tx in &self.worker_command_txs {
+            tx.send(per_worker).unwrap();
+        }
+
+        let elapsed = self.elapsed_rx.recv().unwrap();
+        for _ in 0..WORKERS {
+            self.worker_done_rx.recv().unwrap();
+        }
+        elapsed
+    }
+}
+
+impl Drop for FaninBench {
+    fn drop(&mut self) {
+        let _ = self.sink_command_tx.send(0);
+        for tx in &self.worker_command_txs {
+            let _ = tx.send(0);
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Fan-out: one `PushFanOut` ventilator round-robins `BATCH_SIZE` messages across
@@ -62,77 +322,8 @@ fn monocoque_fanout(c: &mut Criterion) {
     for &size in MESSAGE_SIZES {
         group.throughput(Throughput::Elements(BATCH_SIZE as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            let payload = Bytes::from(vec![0u8; size]);
-
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-
-                for _ in 0..iters {
-                    let (port_tx, port_rx) = mpsc::channel::<u16>();
-                    let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
-                    // WORKERS receivers plus the ventilator align on this barrier.
-                    let barrier = Arc::new(Barrier::new(WORKERS + 1));
-
-                    let vent_payload = payload.clone();
-                    let vent_barrier = barrier.clone();
-                    let ventilator = thread::spawn(move || {
-                        let rt = monocoque::rt::LocalRuntime::new().unwrap();
-                        rt.block_on(async move {
-                            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                            port_tx.send(listener.local_addr().unwrap().port()).unwrap();
-
-                            let mut fanout = PushFanOut::accept_workers(
-                                &listener,
-                                WORKERS,
-                                coalescing_options(),
-                            )
-                            .await
-                            .unwrap();
-
-                            // Per-message round-robin with coalescing keeps all
-                            // workers interleaved and batches each worker's writes
-                            // at the 64 KB coalesce threshold. Batching a whole
-                            // worker share instead serializes the pool, so this is
-                            // the faster path.
-                            vent_barrier.wait();
-                            for _ in 0..BATCH_SIZE {
-                                fanout.send(vec![vent_payload.clone()]).await.unwrap();
-                            }
-                            fanout.flush().await.unwrap();
-                        });
-                    });
-
-                    let port = port_rx.recv().unwrap();
-
-                    for _ in 0..WORKERS {
-                        let worker_barrier = barrier.clone();
-                        let worker_elapsed = elapsed_tx.clone();
-                        thread::spawn(move || {
-                            let rt = monocoque::rt::LocalRuntime::new().unwrap();
-                            rt.block_on(async move {
-                                let mut pull =
-                                    PullSocket::connect(("127.0.0.1", port)).await.unwrap();
-                                worker_barrier.wait();
-                                let t0 = Instant::now();
-                                for _ in 0..PER_WORKER {
-                                    pull.recv().await.unwrap();
-                                }
-                                worker_elapsed.send(t0.elapsed()).unwrap();
-                            });
-                        });
-                    }
-                    drop(elapsed_tx);
-
-                    let mut slowest = Duration::ZERO;
-                    for _ in 0..WORKERS {
-                        slowest = slowest.max(elapsed_rx.recv().unwrap());
-                    }
-                    ventilator.join().unwrap();
-                    total += slowest;
-                }
-
-                total
-            });
+            let mut bench = FanoutBench::new(size);
+            b.iter_custom(|iters| bench.run_iterations(iters));
         });
     }
 
@@ -175,77 +366,8 @@ fn fanin(c: &mut Criterion, group_name: &str, coalesce: bool) {
     for &size in MESSAGE_SIZES {
         group.throughput(Throughput::Elements(BATCH_SIZE as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            let payload = Bytes::from(vec![0u8; size]);
-
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-
-                for _ in 0..iters {
-                    let (port_tx, port_rx) = mpsc::channel::<u16>();
-                    let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
-
-                    let sink_thread = thread::spawn(move || {
-                        let rt = monocoque::rt::LocalRuntime::new().unwrap();
-                        rt.block_on(async move {
-                            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                            port_tx.send(listener.local_addr().unwrap().port()).unwrap();
-
-                            let mut sink = PullFanIn::accept_workers(
-                                &listener,
-                                WORKERS,
-                                SocketOptions::default().with_buffer_sizes(16384, 16384),
-                            )
-                            .await
-                            .unwrap();
-
-                            let t0 = Instant::now();
-                            // One await returns a whole burst of merged messages.
-                            let mut received = 0usize;
-                            while received < BATCH_SIZE {
-                                match sink.recv_batch().await.unwrap() {
-                                    Some(batch) => received += batch.len(),
-                                    None => break,
-                                }
-                            }
-                            elapsed_tx.send(t0.elapsed()).unwrap();
-                        });
-                    });
-
-                    let port = port_rx.recv().unwrap();
-
-                    let mut workers = Vec::with_capacity(WORKERS);
-                    for _ in 0..WORKERS {
-                        let worker_payload = payload.clone();
-                        workers.push(thread::spawn(move || {
-                            let rt = monocoque::rt::LocalRuntime::new().unwrap();
-                            rt.block_on(async move {
-                                let options = if coalesce {
-                                    coalescing_options()
-                                } else {
-                                    SocketOptions::default().with_buffer_sizes(16384, 16384)
-                                };
-                                let mut push =
-                                    PushSocket::connect_with_options(("127.0.0.1", port), options)
-                                        .await
-                                        .unwrap();
-                                for _ in 0..PER_WORKER {
-                                    push.send(vec![worker_payload.clone()]).await.unwrap();
-                                }
-                                // No-op in eager mode; drains the buffer when coalescing.
-                                push.flush().await.unwrap();
-                            });
-                        }));
-                    }
-
-                    for worker in workers {
-                        worker.join().unwrap();
-                    }
-                    sink_thread.join().unwrap();
-                    total += elapsed_rx.recv().unwrap();
-                }
-
-                total
-            });
+            let mut bench = FaninBench::new(size, coalesce);
+            b.iter_custom(|iters| bench.run_iterations(iters));
         });
     }
 
