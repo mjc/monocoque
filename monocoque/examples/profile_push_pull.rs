@@ -11,6 +11,8 @@ use monocoque::rt::TcpListener;
 use monocoque::rt::TcpStream;
 use monocoque::zmq::{PullSocket, PushSocket, SocketOptions};
 use std::ffi::{c_char, c_void};
+use std::io::{Read, Write};
+use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc;
@@ -70,6 +72,8 @@ enum ProfileCase {
     RawBatch,
     RawSmall,
     RawMulti,
+    RawSmallCompioRead,
+    RawSmallCompioWrite,
 }
 
 struct PushPullProfile {
@@ -217,6 +221,26 @@ fn main() {
                     || raw.run_batch(),
                 );
             }
+            ProfileCase::RawSmallCompioRead => {
+                let mut raw = RawSmallCompioReadProfile::new();
+                run_raw_profile(
+                    "raw TCP compio read, std write",
+                    BATCH_SIZE,
+                    WARMUP_BATCHES,
+                    RAW_SMALL_BATCHES,
+                    || raw.run_batch(),
+                );
+            }
+            ProfileCase::RawSmallCompioWrite => {
+                let mut raw = RawSmallCompioWriteProfile::new();
+                run_raw_profile(
+                    "raw TCP compio write, std read",
+                    BATCH_SIZE,
+                    WARMUP_BATCHES,
+                    RAW_SMALL_BATCHES,
+                    || raw.run_batch(),
+                );
+            }
         }
     }
 }
@@ -230,6 +254,8 @@ fn parse_cases() -> Vec<ProfileCase> {
             ProfileCase::RawBatch,
             ProfileCase::RawSmall,
             ProfileCase::RawMulti,
+            ProfileCase::RawSmallCompioRead,
+            ProfileCase::RawSmallCompioWrite,
         ];
     };
 
@@ -239,11 +265,13 @@ fn parse_cases() -> Vec<ProfileCase> {
         "recv-batch" => vec![ProfileCase::Recv(RecvMode::Batch)],
         "raw-batch" => vec![ProfileCase::RawBatch],
         "raw-small" => vec![ProfileCase::RawSmall],
+        "raw-small-compio-read" => vec![ProfileCase::RawSmallCompioRead],
+        "raw-small-compio-write" => vec![ProfileCase::RawSmallCompioWrite],
         "raw-multi" => vec![ProfileCase::RawMulti],
         "all" => parse_cases_from_all(),
         other => {
             eprintln!(
-                "unknown case {other:?}; expected all, recv, recv-into, recv-batch, raw-batch, raw-small, or raw-multi"
+                "unknown case {other:?}; expected all, recv, recv-into, recv-batch, raw-batch, raw-small, raw-small-compio-read, raw-small-compio-write, or raw-multi"
             );
             std::process::exit(2);
         }
@@ -258,6 +286,8 @@ fn parse_cases_from_all() -> Vec<ProfileCase> {
         ProfileCase::RawBatch,
         ProfileCase::RawSmall,
         ProfileCase::RawMulti,
+        ProfileCase::RawSmallCompioRead,
+        ProfileCase::RawSmallCompioWrite,
     ]
 }
 
@@ -451,6 +481,157 @@ impl RawTcpProfile {
 }
 
 impl Drop for RawTcpProfile {
+    fn drop(&mut self) {
+        let _ = self.command_tx.send(0);
+        if let Some(receiver_thread) = self.receiver_thread.take() {
+            let _ = receiver_thread.join();
+        }
+    }
+}
+
+struct RawSmallCompioReadProfile {
+    payload: Vec<u8>,
+    stream: StdTcpStream,
+    command_tx: mpsc::Sender<usize>,
+    receiver_elapsed_rx: mpsc::Receiver<Duration>,
+    receiver_thread: Option<JoinHandle<()>>,
+}
+
+impl RawSmallCompioReadProfile {
+    fn new() -> Self {
+        let (port_tx, port_rx) = mpsc::channel::<u16>();
+        let (command_tx, command_rx) = mpsc::channel::<usize>();
+        let (receiver_elapsed_tx, receiver_elapsed_rx) = mpsc::channel::<Duration>();
+
+        let receiver_thread = thread::spawn(move || {
+            let rt = monocoque::rt::LocalRuntime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                port_tx.send(listener.local_addr().unwrap().port()).unwrap();
+
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut read_buf = vec![0u8; MESSAGE_SIZE];
+                while let Ok(count) = command_rx.recv() {
+                    if count == 0 {
+                        break;
+                    }
+
+                    let start = std::time::Instant::now();
+                    for _ in 0..count {
+                        let BufResult(result, returned) = stream.read_exact(read_buf).await;
+                        read_buf = returned;
+                        result.unwrap();
+                        coz_progress!();
+                    }
+                    receiver_elapsed_tx.send(start.elapsed()).unwrap();
+                }
+            });
+        });
+
+        let port = port_rx.recv().unwrap();
+        let stream = StdTcpStream::connect(("127.0.0.1", port)).unwrap();
+
+        Self {
+            payload: vec![0u8; MESSAGE_SIZE],
+            stream,
+            command_tx,
+            receiver_elapsed_rx,
+            receiver_thread: Some(receiver_thread),
+        }
+    }
+
+    fn run_batch(&mut self) -> (Duration, Duration) {
+        self.command_tx.send(BATCH_SIZE).unwrap();
+
+        let sender_start = std::time::Instant::now();
+        for _ in 0..BATCH_SIZE {
+            self.stream.write_all(&self.payload).unwrap();
+        }
+        let sender_elapsed = sender_start.elapsed();
+
+        let receiver_elapsed = self.receiver_elapsed_rx.recv().unwrap();
+        (sender_elapsed, receiver_elapsed)
+    }
+}
+
+impl Drop for RawSmallCompioReadProfile {
+    fn drop(&mut self) {
+        let _ = self.command_tx.send(0);
+        if let Some(receiver_thread) = self.receiver_thread.take() {
+            let _ = receiver_thread.join();
+        }
+    }
+}
+
+struct RawSmallCompioWriteProfile {
+    payload: Bytes,
+    rt: monocoque::rt::LocalRuntime,
+    stream: TcpStream,
+    command_tx: mpsc::Sender<usize>,
+    receiver_elapsed_rx: mpsc::Receiver<Duration>,
+    receiver_thread: Option<JoinHandle<()>>,
+}
+
+impl RawSmallCompioWriteProfile {
+    fn new() -> Self {
+        let (port_tx, port_rx) = mpsc::channel::<u16>();
+        let (command_tx, command_rx) = mpsc::channel::<usize>();
+        let (receiver_elapsed_tx, receiver_elapsed_rx) = mpsc::channel::<Duration>();
+
+        let receiver_thread = thread::spawn(move || {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            port_tx.send(listener.local_addr().unwrap().port()).unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut read_buf = vec![0u8; MESSAGE_SIZE];
+            while let Ok(count) = command_rx.recv() {
+                if count == 0 {
+                    break;
+                }
+
+                let start = std::time::Instant::now();
+                for _ in 0..count {
+                    stream.read_exact(&mut read_buf).unwrap();
+                }
+                receiver_elapsed_tx.send(start.elapsed()).unwrap();
+            }
+        });
+
+        let port = port_rx.recv().unwrap();
+        let rt = monocoque::rt::LocalRuntime::new().unwrap();
+        let stream = rt
+            .block_on(TcpStream::connect(("127.0.0.1", port)))
+            .unwrap();
+
+        Self {
+            payload: Bytes::from(vec![0u8; MESSAGE_SIZE]),
+            rt,
+            stream,
+            command_tx,
+            receiver_elapsed_rx,
+            receiver_thread: Some(receiver_thread),
+        }
+    }
+
+    fn run_batch(&mut self) -> (Duration, Duration) {
+        self.command_tx.send(BATCH_SIZE).unwrap();
+
+        let sender_start = std::time::Instant::now();
+        self.rt.block_on(async {
+            for _ in 0..BATCH_SIZE {
+                let BufResult(result, _) = self.stream.write_all(self.payload.clone()).await;
+                result.unwrap();
+                coz_progress!();
+            }
+        });
+        let sender_elapsed = sender_start.elapsed();
+
+        let receiver_elapsed = self.receiver_elapsed_rx.recv().unwrap();
+        (sender_elapsed, receiver_elapsed)
+    }
+}
+
+impl Drop for RawSmallCompioWriteProfile {
     fn drop(&mut self) {
         let _ = self.command_tx.send(0);
         if let Some(receiver_thread) = self.receiver_thread.take() {
