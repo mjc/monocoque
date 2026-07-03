@@ -62,6 +62,11 @@ harness = false
 required-features = ["zmq"]
 
 [[bench]]
+name = "hotspots"
+harness = false
+required-features = ["zmq"]
+
+[[bench]]
 name = "measure_latency"
 harness = false
 required-features = ["zmq"]
