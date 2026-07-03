@@ -161,6 +161,10 @@ name = "plain_auth_demo"
 required-features = ["zmq", "runtime-compio"]
 
 [[example]]
+name = "profile_push_pull"
+required-features = ["zmq"]
+
+[[example]]
 name = "curve_demo"
 required-features = ["zmq", "runtime-compio"]
 
