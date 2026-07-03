@@ -148,8 +148,12 @@ impl ZmtpDecoder {
             return Ok(None);
         }
 
+        let front = src.front_chunk();
         let mut hdr = [0u8; 9];
-        if !src.copy_prefix(2, &mut hdr) {
+        if front.len() >= 2 {
+            hdr[0] = front[0];
+            hdr[1] = front[1];
+        } else if !src.copy_prefix(2, &mut hdr) {
             return Ok(None);
         }
 
@@ -169,7 +173,9 @@ impl ZmtpDecoder {
 
         // === Body length ===
         let body_len = if is_long {
-            if !src.copy_prefix(9, &mut hdr) {
+            if front.len() >= 9 {
+                hdr.copy_from_slice(&front[..9]);
+            } else if !src.copy_prefix(9, &mut hdr) {
                 return Ok(None);
             }
             let mut buf = &hdr[1..9];
@@ -197,10 +203,7 @@ impl ZmtpDecoder {
 
         // === Fast path: entire frame present ===
         if src.len() >= total_len {
-            src.advance(header_len);
-            let payload = src
-                .take_bytes(body_len)
-                .expect("len check ensures body is available");
+            let payload = src.take_bytes_after_available(header_len, body_len);
             return Ok(Some(ZmtpFrame { flags, payload }));
         }
 
