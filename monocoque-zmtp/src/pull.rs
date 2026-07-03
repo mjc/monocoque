@@ -117,6 +117,9 @@ where
                     // the next recv() call will flush it.
                 }
                 crate::base::FrameResult::Data(more, payload) => {
+                    if !more && self.frames.is_empty() {
+                        return Ok(Some(vec![payload]));
+                    }
                     self.frames.push(payload);
                     if !more {
                         let msg: Vec<Bytes> = self.frames.drain(..).collect();
