@@ -82,7 +82,7 @@ impl FanoutBench {
                     }
 
                     for _ in 0..count {
-                        fanout.send(vec![vent_payload.clone()]).await.unwrap();
+                        fanout.send_one(vent_payload.clone()).await.unwrap();
                     }
                     fanout.flush().await.unwrap();
                     vent_done_tx.send(()).unwrap();
@@ -248,7 +248,7 @@ impl FaninBench {
                         }
 
                         for _ in 0..count {
-                            push.send(vec![worker_payload.clone()]).await.unwrap();
+                            push.send_one(worker_payload.clone()).await.unwrap();
                         }
                         push.flush().await.unwrap();
                         worker_done_tx.send(()).unwrap();
