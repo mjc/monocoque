@@ -309,20 +309,7 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
 
     // Fast path: single-frame message (common case)
     if msg.len() == 1 {
-        let part = &msg[0];
-        let is_long = part.len() >= 256;
-        let flags = if is_long { 0x02 } else { 0x00 }; // No MORE flag
-
-        buf.reserve(if is_long { 9 } else { 2 } + part.len());
-        buf.extend_from_slice(&[flags]);
-
-        if is_long {
-            buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
-        } else {
-            buf.extend_from_slice(&[part.len() as u8]);
-        }
-
-        buf.extend_from_slice(part);
+        encode_single(&msg[0], buf);
         return;
     }
 
@@ -350,4 +337,19 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
 
         buf.extend_from_slice(part);
     }
+}
+
+/// Encode a single-frame data message directly into `buf`.
+#[inline]
+pub fn encode_single(part: &Bytes, buf: &mut BytesMut) {
+    let is_long = part.len() >= 256;
+    if is_long {
+        buf.reserve(9 + part.len());
+        buf.extend_from_slice(&[0x02]);
+        buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+    } else {
+        buf.reserve(2 + part.len());
+        buf.extend_from_slice(&[0x00, part.len() as u8]);
+    }
+    buf.extend_from_slice(part);
 }
