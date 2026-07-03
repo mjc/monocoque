@@ -17,10 +17,10 @@
 
 use bytes::Bytes;
 use compio::net::TcpListener;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use monocoque::zmq::{DealerSocket, RouterSocket, SocketOptions};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const MESSAGE_SIZE: usize = 64;
@@ -80,7 +80,7 @@ fn monocoque_multithreaded_dealers(c: &mut Criterion) {
                                         while received_count.load(Ordering::Relaxed)
                                             < expected_total
                                         {
-                                            if let Some(msg) = router.recv().await {
+                                            if let Ok(Some(msg)) = router.recv().await {
                                                 received_count.fetch_add(1, Ordering::Relaxed);
                                                 router.send(msg).await.ok();
                                             } else {
@@ -131,7 +131,7 @@ fn monocoque_multithreaded_dealers(c: &mut Criterion) {
                                         }
                                         // Receive batch
                                         for _ in 0..BATCH_SIZE {
-                                            if dealer.recv().await.is_none() {
+                                            if !matches!(dealer.recv().await, Ok(Some(_))) {
                                                 break;
                                             }
                                         }
@@ -200,7 +200,7 @@ fn monocoque_multithreaded_independent_pairs(c: &mut Criterion) {
                                     .unwrap();
 
                                     for _ in 0..MESSAGES_PER_THREAD {
-                                        if let Some(msg) = router.recv().await {
+                                        if let Ok(Some(msg)) = router.recv().await {
                                             router.send(msg).await.ok();
                                         }
                                     }
@@ -227,7 +227,7 @@ fn monocoque_multithreaded_independent_pairs(c: &mut Criterion) {
                                     }
                                     // Receive batch
                                     for _ in 0..BATCH_SIZE {
-                                        if dealer.recv().await.is_none() {
+                                        if !matches!(dealer.recv().await, Ok(Some(_))) {
                                             break;
                                         }
                                     }
@@ -299,7 +299,7 @@ fn monocoque_core_efficiency(c: &mut Criterion) {
                                     .unwrap();
 
                                     for _ in 0..MESSAGES_PER_THREAD {
-                                        if let Some(msg) = router.recv().await {
+                                        if let Ok(Some(msg)) = router.recv().await {
                                             router.send(msg).await.ok();
                                         }
                                     }
@@ -325,7 +325,7 @@ fn monocoque_core_efficiency(c: &mut Criterion) {
                                     }
                                     // Receive batch
                                     for _ in 0..BATCH_SIZE {
-                                        if dealer.recv().await.is_none() {
+                                        if !matches!(dealer.recv().await, Ok(Some(_))) {
                                             break;
                                         }
                                     }

@@ -13,7 +13,7 @@
 
 use bytes::Bytes;
 use compio::net::TcpListener;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use monocoque::zmq::{DealerSocket, RepSocket, ReqSocket, RouterSocket, SocketOptions};
 use std::time::Duration;
 
@@ -67,14 +67,16 @@ fn monocoque_req_rep_throughput(c: &mut Criterion) {
                     let server_task = compio::runtime::spawn(async move {
                         let mut rep = rep;
                         for _ in 0..MESSAGE_COUNT {
-                            let msg = rep.recv().await.unwrap();
+                            let Some(msg) = rep.recv().await.unwrap() else {
+                                break;
+                            };
                             rep.send(msg).await.ok();
                         }
                     });
 
                     for _ in 0..MESSAGE_COUNT {
                         req.send(vec![black_box(payload.clone())]).await.unwrap();
-                        if let Some(_) = req.recv().await {
+                        if let Ok(Some(_)) = req.recv().await {
                             // Message received
                         }
                     }
@@ -162,7 +164,9 @@ fn monocoque_dealer_router_throughput(c: &mut Criterion) {
                         .unwrap();
 
                         for _ in 0..MESSAGE_COUNT {
-                            let msg = router.recv().await.unwrap();
+                            let Some(msg) = router.recv().await.unwrap() else {
+                                break;
+                            };
                             router.send(msg).await.ok();
                         }
                     });
@@ -177,7 +181,7 @@ fn monocoque_dealer_router_throughput(c: &mut Criterion) {
 
                     for _ in 0..MESSAGE_COUNT {
                         dealer.send(vec![black_box(payload.clone())]).await.unwrap();
-                        if let Some(_) = dealer.recv().await {
+                        if let Ok(Some(_)) = dealer.recv().await {
                             // Message received
                         }
                     }

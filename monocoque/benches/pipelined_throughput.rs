@@ -16,7 +16,7 @@
 
 use bytes::Bytes;
 use compio::net::TcpListener;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use monocoque::zmq::{DealerSocket, RouterSocket, SocketOptions};
 use std::time::Duration;
 
@@ -64,7 +64,7 @@ fn monocoque_dealer_router_pipelined(c: &mut Criterion) {
                             // Receive batch
                             let mut batch = Vec::with_capacity(BATCH_SIZE);
                             for _ in 0..BATCH_SIZE {
-                                if let Some(msg) = router.recv().await {
+                                if let Ok(Some(msg)) = router.recv().await {
                                     batch.push(msg);
                                 }
                             }
@@ -98,7 +98,7 @@ fn monocoque_dealer_router_pipelined(c: &mut Criterion) {
 
                             // Receive batch
                             for _ in 0..BATCH_SIZE {
-                                if dealer.recv().await.is_none() {
+                                if !matches!(dealer.recv().await, Ok(Some(_))) {
                                     break;
                                 }
                             }
@@ -216,7 +216,7 @@ fn monocoque_extreme_pipeline(c: &mut Criterion) {
 
                     // Echo loop: recv + send immediately
                     for _ in 0..extreme_depth {
-                        if let Some(msg) = router.recv().await {
+                        if let Ok(Some(msg)) = router.recv().await {
                             router.send(msg).await.ok();
                         }
                     }
@@ -237,7 +237,7 @@ fn monocoque_extreme_pipeline(c: &mut Criterion) {
 
                 // Receive all replies
                 for _ in 0..extreme_depth {
-                    if dealer.recv().await.is_none() {
+                    if !matches!(dealer.recv().await, Ok(Some(_))) {
                         break;
                     }
                 }

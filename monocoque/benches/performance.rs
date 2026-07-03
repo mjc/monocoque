@@ -5,14 +5,18 @@
 //! Run with: cargo bench --package monocoque-zmtp
 
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use monocoque_core::inproc::unbind_inproc;
 use monocoque_core::options::SocketOptions;
-use monocoque_zmtp::{DealerSocket, PairSocket, PubSocket, PullSocket, PushSocket, SubSocket};
+use monocoque_zmtp::DealerSocket;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-// Helper to run async code in compio runtime
-fn runtime() -> compio::runtime::Runtime {
-    compio::runtime::Runtime::new().expect("Failed to create runtime")
+static ENDPOINT_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn next_endpoint(label: &str) -> String {
+    let id = ENDPOINT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("inproc://bench-dealer-{label}-{id}")
 }
 
 /// Benchmark REQ/REP pattern latency
@@ -22,11 +26,9 @@ fn bench_req_rep_latency(c: &mut Criterion) {
 
     group.bench_function("single_message", |b| {
         b.iter(|| {
-            runtime().block_on(async {
-                // Simple echo test - measure round-trip time
-                let msg = vec![Bytes::from("ping")];
-                black_box(msg);
-            });
+            // Simple echo test - measure message construction without runtime setup.
+            let msg = vec![Bytes::from("ping")];
+            black_box(msg);
         });
     });
 
@@ -41,11 +43,9 @@ fn bench_pub_sub_throughput(c: &mut Criterion) {
 
     group.bench_function("1kb_messages", |b| {
         b.iter(|| {
-            runtime().block_on(async {
-                let data = vec![0u8; 1024];
-                let msg = vec![Bytes::from(data)];
-                black_box(msg);
-            });
+            let data = vec![0u8; 1024];
+            let msg = vec![Bytes::from(data)];
+            black_box(msg);
         });
     });
 
@@ -60,12 +60,10 @@ fn bench_push_pull_pipeline(c: &mut Criterion) {
 
     group.bench_function("batch_1000", |b| {
         b.iter(|| {
-            runtime().block_on(async {
-                for _ in 0..1000 {
-                    let msg = vec![Bytes::from(vec![0u8; 1024])];
-                    black_box(msg);
-                }
-            });
+            for _ in 0..1000 {
+                let msg = vec![Bytes::from(vec![0u8; 1024])];
+                black_box(msg);
+            }
         });
     });
 
@@ -143,22 +141,27 @@ fn bench_socket_options(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark DEALER socket creation
+/// Benchmark DEALER socket creation.
 fn bench_dealer_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("dealer_creation");
 
-    group.bench_function("new_with_defaults", |b| {
+    group.bench_function("bind_inproc_defaults", |b| {
         b.iter(|| {
-            let socket: DealerSocket = DealerSocket::new();
+            let endpoint = next_endpoint("bind");
+            let socket = DealerSocket::bind_inproc(&endpoint, SocketOptions::default()).unwrap();
             black_box(socket);
+            unbind_inproc(&endpoint).unwrap();
         });
     });
 
-    group.bench_function("new_with_options", |b| {
+    group.bench_function("connect_inproc_with_options", |b| {
         b.iter(|| {
+            let endpoint = next_endpoint("connect");
+            let server = DealerSocket::bind_inproc(&endpoint, SocketOptions::default()).unwrap();
             let opts = SocketOptions::new().with_recv_timeout(Duration::from_secs(5));
-            let socket = DealerSocket::with_options(opts);
-            black_box(socket);
+            let client = DealerSocket::connect_inproc(&endpoint, opts).unwrap();
+            black_box((server, client));
+            unbind_inproc(&endpoint).unwrap();
         });
     });
 
