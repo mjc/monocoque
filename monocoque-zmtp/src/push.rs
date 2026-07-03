@@ -121,14 +121,18 @@ where
     pub async fn send_one(&mut self, frame: Bytes) -> io::Result<()> {
         trace!("[PUSH] Sending 1 frame");
 
-        let msg = std::slice::from_ref(&frame);
         if self.base.options.write_coalescing {
-            self.base.send_coalesced(msg).await?;
-        } else if self.base.should_vectored_write(msg) {
-            self.base.send_vectored(msg).await?;
+            if self.base.encode_one_coalesced(&frame)? {
+                self.base.flush_send_buffer().await?;
+            }
         } else {
-            self.base.encode_message_to_write_buf(msg)?;
-            self.base.write_from_buf().await?;
+            let msg = std::slice::from_ref(&frame);
+            if self.base.should_vectored_write(msg) {
+                self.base.send_vectored(msg).await?;
+            } else {
+                self.base.encode_message_to_write_buf(msg)?;
+                self.base.write_from_buf().await?;
+            }
         }
 
         if self.base.check_heartbeat()? {
