@@ -141,6 +141,11 @@ where
                 crate::base::FrameResult::NeedMore => return Ok(false),
                 crate::base::FrameResult::CommandHandled => {}
                 crate::base::FrameResult::Data(more, payload) => {
+                    if !more && self.frames.is_empty() {
+                        out.clear();
+                        out.push(payload);
+                        return Ok(true);
+                    }
                     self.frames.push(payload);
                     if !more {
                         out.clear();
@@ -220,6 +225,10 @@ where
                         }
                     }
                     crate::base::FrameResult::Data(more, payload) => {
+                        if !more && self.frames.is_empty() {
+                            out.push(payload);
+                            return Ok(true);
+                        }
                         // Accumulate in the shared frame buffer so a multipart
                         // message split across reads (or across a try_recv_into)
                         // is reassembled correctly, then move it into `out`,
