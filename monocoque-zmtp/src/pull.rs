@@ -179,6 +179,10 @@ where
                         }
                     }
                     crate::base::FrameResult::Data(more, payload) => {
+                        if !more && self.frames.is_empty() {
+                            trace!("[PULL] Received 1 frame");
+                            return Ok(Some(vec![payload]));
+                        }
                         self.frames.push(payload);
                         if !more {
                             let msg: Vec<Bytes> = self.frames.drain(..).collect();
