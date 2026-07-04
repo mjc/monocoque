@@ -36,15 +36,15 @@ PUSH/PULL one-way pipeline, 10 000 messages per iteration.
 | 4 KB | 292 K | 417 K |
 | 16 KB | 266 K | 317 K |
 
-**coalesced** - `with_write_coalescing(true)`, 64 KB flush threshold:
+**coalesced** - `with_write_coalescing(true)`, 96 KB flush threshold:
 
 | Message size | compio | tokio |
 |---|---|---|
-| 64 B | 9.2 M | **13.6 M** |
-| 256 B | 5.6 M | **9.8 M** |
-| 1 KB | 2.4 M | **5.3 M** |
-| 4 KB | 841 K | **1.74 M** |
-| 16 KB | 268 K | **473 K** |
+| 64 B | 21.1 M | **23.7 M** |
+| 256 B | 12.3 M | **12.8 M** |
+| 1 KB | **4.2 M** | 4.2 M |
+| 4 KB | 1.07 M | **1.14 M** |
+| 16 KB | 250 K | **328 K** |
 
 **rust-zmq (libzmq)**:
 
@@ -56,15 +56,15 @@ PUSH/PULL one-way pipeline, 10 000 messages per iteration.
 | 4 KB | 328 K |
 | 16 KB | 117 K |
 
-Coalesced, both backends beat libzmq by a wide margin: ~7x (compio) to ~10x
-(tokio) at 64 B, tapering to ~2.3x and ~4.0x at 16 KB. In eager mode both trail
+Coalesced, both backends beat libzmq by a wide margin: ~16x (compio) to ~18x
+(tokio) at 64 B, tapering to ~2.1x and ~2.8x at 16 KB. In eager mode both trail
 libzmq, which amortizes its syscall over an internal IO-thread batch.
 
 The PULL side allocates a `Vec<Bytes>` per message by default. Receiving into a
 reused buffer with `recv_into` removes that allocation; the
-`push_pull_coalesced_recv_into` bench case shows ~1.23x at 64 B (9.2 M to 11.3 M
-on compio, 13.6 M to 15.7 M on tokio) and ~13% at 256 B over the `recv()` path
-(the gain tapers as messages grow and the path becomes bandwidth-bound). See
+`push_pull_coalesced_recv_into` bench case now shows a smaller gain on this
+batched path (about 4% at 64 B on compio and tokio, and about 2-4% at 256 B).
+The gain tapers as messages grow and the path becomes bandwidth-bound. See
 `docs/performance.md` for details.
 
 ---
@@ -202,7 +202,7 @@ bandwidth is msg/s x frame size):
 | 16 KB | 259 K | 260 K |
 
 The ventilator round-robins one message at a time; with coalescing each worker's
-buffer flushes at the 64 KB threshold, so the writes stay batched while the four
+buffer flushes at the 96 KB threshold, so the writes stay batched while the four
 workers receive interleaved and in parallel. Handing each worker its whole share
 in one batched write instead serializes the pool (worker 1 waits for worker 0's
 entire share) and is markedly slower at large messages, so the per-message path

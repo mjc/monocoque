@@ -95,16 +95,36 @@ where
 
         if self.base.options.write_coalescing {
             self.base.send_coalesced(&msg).await?;
-        } else if self.base.should_vectored_write(&msg) {
-            // Large frame: write header + body as an iovec, skipping the copy
-            // into the userspace send buffer.
-            self.base.send_vectored(&msg).await?;
         } else {
-            self.base.encode_message_to_write_buf(&msg)?;
-            self.base.write_from_buf().await?;
+            self.base.write_direct(&msg).await?;
         }
 
         // Check heartbeat: send PING if the connection has been idle too long
+        if self.base.check_heartbeat()? {
+            self.base.flush_send_buffer().await?;
+        }
+
+        trace!("[PUSH] Message sent successfully");
+        Ok(())
+    }
+
+    /// Send a single-frame message without allocating a one-element `Vec`.
+    ///
+    /// This is equivalent to `send(vec![frame])`, but keeps the hot path for
+    /// single-frame PUSH/PULL pipelines from measuring the caller's multipart
+    /// container allocation.
+    pub async fn send_one(&mut self, frame: Bytes) -> io::Result<()> {
+        trace!("[PUSH] Sending 1 frame");
+
+        if self.base.options.write_coalescing {
+            if self.base.encode_one_coalesced(&frame)? {
+                self.base.flush_send_buffer().await?;
+            }
+        } else {
+            let msg = std::slice::from_ref(&frame);
+            self.base.write_direct(msg).await?;
+        }
+
         if self.base.check_heartbeat()? {
             self.base.flush_send_buffer().await?;
         }

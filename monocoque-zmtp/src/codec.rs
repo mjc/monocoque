@@ -148,8 +148,12 @@ impl ZmtpDecoder {
             return Ok(None);
         }
 
+        let front = src.front_chunk();
         let mut hdr = [0u8; 9];
-        if !src.copy_prefix(2, &mut hdr) {
+        if front.len() >= 2 {
+            hdr[0] = front[0];
+            hdr[1] = front[1];
+        } else if !src.copy_prefix(2, &mut hdr) {
             return Ok(None);
         }
 
@@ -169,7 +173,9 @@ impl ZmtpDecoder {
 
         // === Body length ===
         let body_len = if is_long {
-            if !src.copy_prefix(9, &mut hdr) {
+            if front.len() >= 9 {
+                hdr.copy_from_slice(&front[..9]);
+            } else if !src.copy_prefix(9, &mut hdr) {
                 return Ok(None);
             }
             let mut buf = &hdr[1..9];
@@ -197,10 +203,7 @@ impl ZmtpDecoder {
 
         // === Fast path: entire frame present ===
         if src.len() >= total_len {
-            src.advance(header_len);
-            let payload = src
-                .take_bytes(body_len)
-                .expect("len check ensures body is available");
+            let payload = src.take_bytes_after_available(header_len, body_len);
             return Ok(Some(ZmtpFrame { flags, payload }));
         }
 
@@ -306,24 +309,16 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
 
     // Fast path: single-frame message (common case)
     if msg.len() == 1 {
-        let part = &msg[0];
-        let is_long = part.len() >= 256;
-        let flags = if is_long { 0x02 } else { 0x00 }; // No MORE flag
-
-        buf.reserve(if is_long { 9 } else { 2 } + part.len());
-        buf.extend_from_slice(&[flags]);
-
-        if is_long {
-            buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
-        } else {
-            buf.extend_from_slice(&[part.len() as u8]);
-        }
-
-        buf.extend_from_slice(part);
+        encode_single(&msg[0], buf);
         return;
     }
 
-    // Multi-frame path
+    let total_len: usize = msg
+        .iter()
+        .map(|part| (if part.len() >= 256 { 9 } else { 2 }) + part.len())
+        .sum();
+    buf.reserve(total_len);
+
     for (i, part) in msg.iter().enumerate() {
         let more = i < msg.len() - 1;
         let is_long = part.len() >= 256;
@@ -336,7 +331,6 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
             flags |= 0x02; // LONG
         }
 
-        buf.reserve(if is_long { 9 } else { 2 } + part.len());
         buf.extend_from_slice(&[flags]);
 
         if is_long {
@@ -346,5 +340,99 @@ pub fn encode_multipart(msg: &[Bytes], buf: &mut BytesMut) {
         }
 
         buf.extend_from_slice(part);
+    }
+}
+
+/// Encode a single-frame data message directly into `buf`.
+#[inline]
+pub fn encode_single(part: &Bytes, buf: &mut BytesMut) {
+    let is_long = part.len() >= 256;
+    if is_long {
+        buf.reserve(9 + part.len());
+        buf.extend_from_slice(&[0x02]);
+        buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+    } else {
+        buf.reserve(2 + part.len());
+        buf.extend_from_slice(&[0x00, part.len() as u8]);
+    }
+    buf.extend_from_slice(part);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_multipart_multi_frame_sets_more_and_long_headers() {
+        let msg = vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from(vec![0xCD; 256]),
+            Bytes::from_static(b"z"),
+        ];
+        let mut buf = BytesMut::new();
+
+        encode_multipart(&msg, &mut buf);
+
+        assert_eq!(buf[0], 0x01);
+        assert_eq!(buf[1], 2);
+        assert_eq!(&buf[2..4], b"ab");
+
+        assert_eq!(buf[4], 0x03);
+        assert_eq!(&buf[5..13], 256u64.to_be_bytes().as_slice());
+        assert_eq!(&buf[13..269], vec![0xCD; 256].as_slice());
+
+        assert_eq!(buf[269], 0x00);
+        assert_eq!(buf[270], 1);
+        assert_eq!(buf[271], b'z');
+        assert_eq!(buf.len(), 272);
+    }
+
+    #[test]
+    fn encode_single_matches_single_frame_multipart_short_and_long() {
+        for part in [Bytes::from_static(b"short"), Bytes::from(vec![0xAB; 256])] {
+            let mut single = BytesMut::new();
+            encode_single(&part, &mut single);
+
+            let mut multipart = BytesMut::new();
+            encode_multipart(std::slice::from_ref(&part), &mut multipart);
+
+            assert_eq!(single, multipart);
+            if part.len() >= 256 {
+                assert_eq!(single[0], 0x02);
+                assert_eq!(&single[1..9], (part.len() as u64).to_be_bytes().as_slice());
+                assert_eq!(&single[9..], &part[..]);
+            } else {
+                assert_eq!(single[0], 0x00);
+                assert_eq!(single[1], part.len() as u8);
+                assert_eq!(&single[2..], &part[..]);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_multipart_multi_frame_appends_to_preallocated_buffer() {
+        let msg = vec![Bytes::from_static(b"a"), Bytes::from_static(b"bc")];
+        let mut buf = BytesMut::with_capacity(16);
+        buf.extend_from_slice(b"prefix");
+
+        encode_multipart(&msg, &mut buf);
+
+        assert_eq!(&buf[..6], b"prefix");
+        assert_eq!(buf[6], 0x01);
+        assert_eq!(buf[7], 1);
+        assert_eq!(buf[8], b'a');
+        assert_eq!(buf[9], 0x00);
+        assert_eq!(buf[10], 2);
+        assert_eq!(&buf[11..13], b"bc");
+        assert_eq!(buf.len(), 13);
+    }
+
+    #[test]
+    fn encode_multipart_empty_message_writes_nothing() {
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+
+        encode_multipart(&[], &mut buf);
+
+        assert_eq!(&buf[..], b"prefix");
     }
 }

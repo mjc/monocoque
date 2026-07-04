@@ -41,17 +41,20 @@ This is the same model used by:
 
 Unsafe code appears **only** in Phase 0 components:
 
-| Module                 | Purpose                   | Unsafe? |
-| ---------------------- | ------------------------- | ------- |
-| `SlabMut`              | stable, pinned IO buffers | ✅      |
-| `IoArena`              | allocation reuse          | ✅      |
-| `compio::IoBuf*` impls | kernel IO                 | ✅      |
-| ZMTP codec             | framing                   | ❌      |
-| Session logic          | state machine             | ❌      |
-| Router hub             | routing                   | ❌      |
-| PUB/SUB index          | matching                  | ❌      |
+| Module                       | Purpose                     | Unsafe? |
+| ---------------------------- | --------------------------- | ------- |
+| `compio::IoBuf*` impls       | kernel IO                   | ✅      |
+| ZMTP read-buffer preparation | expose capacity to `read()` | ✅      |
+| ZMTP codec                   | framing                     | ❌      |
+| Session logic                | state machine               | ❌      |
+| Router hub                   | routing                     | ❌      |
+| PUB/SUB index                | matching                    | ❌      |
 
-Everything above Phase 0 is **100% safe Rust**.
+The old `IoArena`/`SlabMut` allocator was removed. ZMTP read paths now reuse
+socket-local `BytesMut` buffers; the only local unsafe step is marking the
+temporary read buffer initialized before handing it to `AsyncRead`. Callers must
+truncate the buffer to the byte count returned by the read before freezing or
+inspecting it.
 
 ---
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### ⚠️ Breaking Changes
+
+- Removed the public `monocoque_core::alloc` module and its prelude exports.
+  The old `IoArena`/`SlabMut` read allocator has been replaced by socket-local
+  `BytesMut` read buffers, removing the allocator's unsafe ownership model from
+  the public API.
+
 ## 0.1.7 - 2026-07-02
 
 ### 🐛 Bug Fixes

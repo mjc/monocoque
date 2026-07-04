@@ -12,8 +12,8 @@
 //! - **Reconnection support**: Optional endpoint storage and backoff logic
 
 use bytes::{BufMut, Bytes, BytesMut};
+use compio_buf::SetBufInit;
 use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use monocoque_core::alloc::IoArena;
 use monocoque_core::buffer::SegmentedBuffer;
 use monocoque_core::endpoint::Endpoint;
 use monocoque_core::options::SocketOptions;
@@ -28,6 +28,29 @@ use tracing::{debug, trace, warn};
 use crate::codec::ZmtpDecoder;
 use crate::handshake::perform_handshake_with_options;
 use crate::session::SocketType;
+
+pub(crate) const READ_SLAB_SIZE: usize = 64 * 1024;
+
+/// Take a read-sized scratch buffer from `stash`.
+///
+/// # Safety
+///
+/// The returned buffer may contain bytes marked initialized only so it can be
+/// passed to `AsyncRead::read` without zero-filling. Callers must pass it
+/// directly to a read operation and truncate it to the returned byte count
+/// before freezing, inspecting, or otherwise exposing its contents.
+pub(crate) unsafe fn take_read_buffer(stash: &mut BytesMut, read_size: usize) -> BytesMut {
+    if stash.capacity() < read_size {
+        *stash = BytesMut::with_capacity(read_size.max(READ_SLAB_SIZE));
+    }
+    if stash.len() < read_size {
+        // SAFETY: `read_size` is bounded by the capacity check above.
+        unsafe { stash.set_buf_init(read_size) };
+    }
+
+    let tail = stash.split_off(read_size);
+    std::mem::replace(stash, tail)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ZMTP heartbeat helpers (RFC 23 / ZMTP 3.1)
@@ -109,11 +132,11 @@ where
     /// ZMTP frame decoder
     pub(crate) decoder: ZmtpDecoder,
 
-    /// Arena allocator for zero-copy I/O
-    pub(crate) arena: IoArena,
-
     /// Segmented read buffer for incoming data
     pub(crate) recv: SegmentedBuffer,
+
+    /// Tail of the current read slab.
+    pub(crate) read_buf: BytesMut,
 
     /// Reusable write buffer for outgoing data
     pub(crate) write_buf: BytesMut,
@@ -205,6 +228,7 @@ where
     ///
     /// Buffer sizes are taken from `options.read_buffer_size` and `options.write_buffer_size`.
     pub fn new(stream: S, _socket_type: SocketType, options: SocketOptions) -> Self {
+        let read_capacity = options.read_buffer_size.max(READ_SLAB_SIZE);
         let write_capacity = options.write_buffer_size;
         let decoder = if let Some(max) = options.max_msg_size {
             ZmtpDecoder::with_max_frame_size(max)
@@ -216,8 +240,8 @@ where
             endpoint: None,
             reconnect: None,
             decoder,
-            arena: IoArena::new(),
             recv: SegmentedBuffer::new(),
+            read_buf: BytesMut::with_capacity(read_capacity),
             write_buf: BytesMut::with_capacity(write_capacity),
             iov: Vec::new(),
             send_buffer: BytesMut::with_capacity(write_capacity),
@@ -246,6 +270,7 @@ where
         options: SocketOptions,
     ) -> Self {
         let endpoint_str = endpoint.to_string();
+        let read_capacity = options.read_buffer_size.max(READ_SLAB_SIZE);
         let write_capacity = options.write_buffer_size;
         let decoder = if let Some(max) = options.max_msg_size {
             ZmtpDecoder::with_max_frame_size(max)
@@ -257,8 +282,8 @@ where
             endpoint: Some(endpoint),
             reconnect: Some(ReconnectState::new(&options)),
             decoder,
-            arena: IoArena::new(),
             recv: SegmentedBuffer::new(),
+            read_buf: BytesMut::with_capacity(read_capacity),
             write_buf: BytesMut::with_capacity(write_capacity),
             iov: Vec::new(),
             send_buffer: BytesMut::with_capacity(write_capacity),
@@ -499,7 +524,18 @@ where
 
         // Read from stream
         use compio_buf::BufResult;
-        let slab = self.arena.alloc_mut(self.options.read_buffer_size);
+
+        if matches!(self.options.recv_timeout, Some(dur) if dur.is_zero()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Socket is in non-blocking mode and no data is available",
+            ));
+        }
+
+        // SAFETY: `buf` is passed directly to `read`; below, every successful
+        // path truncates it to `n` before freezing, and error/EOF paths drop it
+        // without inspecting its contents.
+        let buf = unsafe { take_read_buffer(&mut self.read_buf, self.options.read_buffer_size) };
 
         // Get stream reference only for I/O
         let stream = self
@@ -508,17 +544,11 @@ where
             .expect("BUG: stream must be Some  -  checked is_none() above");
 
         // Apply recv timeout
-        let BufResult(result, slab) = match self.options.recv_timeout {
-            None => AsyncRead::read(stream, slab).await,
-            Some(dur) if dur.is_zero() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Socket is in non-blocking mode and no data is available",
-                ));
-            }
+        let BufResult(result, mut buf) = match self.options.recv_timeout {
+            None => AsyncRead::read(stream, buf).await,
             Some(dur) => {
                 use monocoque_core::rt::timeout;
-                match timeout(dur, AsyncRead::read(stream, slab)).await {
+                match timeout(dur, AsyncRead::read(stream, buf)).await {
                     Ok(result) => result,
                     Err(_) => {
                         return Err(io::Error::new(
@@ -540,7 +570,8 @@ where
         }
 
         // Push bytes into recv buffer
-        self.recv.push(slab.freeze());
+        buf.truncate(n);
+        self.recv.push(buf.freeze());
 
         // Update heartbeat idle timer: data was received so we are not idle
         self.note_recv();
@@ -807,6 +838,16 @@ where
         Ok(())
     }
 
+    /// Write `msg` immediately using either the vectored or buffered path.
+    pub(crate) async fn write_direct(&mut self, msg: &[Bytes]) -> io::Result<()> {
+        if self.should_vectored_write(msg) {
+            self.send_vectored(msg).await
+        } else {
+            self.encode_message_to_write_buf(msg)?;
+            self.write_from_buf().await
+        }
+    }
+
     /// Close the socket gracefully by shutting down the underlying stream.
     ///
     /// Sends a TCP FIN (or equivalent) to the peer and drops the connection.
@@ -878,6 +919,30 @@ where
             self.flush_send_buffer().await?;
         }
         Ok(())
+    }
+
+    /// Encode one data frame into `send_buffer`.
+    ///
+    /// Returns `true` when the coalescing threshold has been reached and the
+    /// caller should flush.
+    pub(crate) fn encode_one_coalesced(&mut self, frame: &Bytes) -> io::Result<bool> {
+        if self.curve_cipher.is_none() {
+            crate::codec::encode_single(frame, &mut self.send_buffer);
+            return Ok(self.send_buffer.len() >= self.options.write_coalesce_threshold);
+        }
+        self.encode_one_curve_coalesced(frame)
+    }
+
+    fn encode_one_curve_coalesced(&mut self, frame: &Bytes) -> io::Result<bool> {
+        let cipher = self
+            .curve_cipher
+            .as_mut()
+            .expect("checked by encode_one_coalesced");
+        let body = cipher
+            .encrypt_frame(frame, false)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        append_zmtp_cmd_frame(&mut self.send_buffer, &body);
+        Ok(self.send_buffer.len() >= self.options.write_coalesce_threshold)
     }
 
     /// Decode the next frame from the receive buffer, handling CURVE decryption and PING/PONG.
@@ -1045,6 +1110,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const PAYLOAD: &[u8] = b"abcdef";
+
+    #[test]
+    fn take_read_buffer_initializes_capacity_before_split() {
+        let mut stash = BytesMut::with_capacity(READ_SLAB_SIZE);
+
+        // SAFETY: the test verifies only buffer length/capacity bookkeeping and
+        // never inspects the possibly uninitialized contents.
+        let buf = unsafe { take_read_buffer(&mut stash, 256) };
+
+        assert_eq!(buf.len(), 256);
+        assert_eq!(stash.len(), 0);
+        assert!(stash.capacity() >= READ_SLAB_SIZE - 256);
+    }
 
     #[derive(Clone, Debug, Default)]
     struct WriteLog(Arc<Mutex<Vec<Vec<u8>>>>);

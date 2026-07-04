@@ -511,7 +511,7 @@ impl Default for SocketOptions {
             xpub_nodrop: false,
             invert_matching: false,
             write_coalescing: false,
-            write_coalesce_threshold: 65536,
+            write_coalesce_threshold: 96 * 1024,
             vectored_write_threshold: 32768,
         }
     }
@@ -732,7 +732,7 @@ impl SocketOptions {
     /// let opts = SocketOptions::new().with_read_buffer_size(16384);
     /// ```
     pub const fn with_read_buffer_size(mut self, size: usize) -> Self {
-        self.read_buffer_size = size;
+        self.read_buffer_size = if size == 0 { 1 } else { size };
         self
     }
 
@@ -753,7 +753,7 @@ impl SocketOptions {
     /// let opts = SocketOptions::new().with_buffer_sizes(4096, 4096);
     /// ```
     pub const fn with_buffer_sizes(mut self, read_size: usize, write_size: usize) -> Self {
-        self.read_buffer_size = read_size;
+        self.read_buffer_size = if read_size == 0 { 1 } else { read_size };
         self.write_buffer_size = write_size;
         self
     }
